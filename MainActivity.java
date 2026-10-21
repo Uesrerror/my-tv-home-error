@@ -18,8 +18,6 @@ import android.graphics.Typeface;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
-import android.location.Location;
-import android.location.LocationManager;
 import android.media.AudioManager;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
@@ -74,6 +72,18 @@ public class MainActivity extends Activity {
     private static final int REQ_PICK_WALLPAPER = 1001;
     private static final int REQ_PICK_APP_ICON = 1002;
 
+    // ล็อกพิกัดตายตัว: ตำบลดอนกรวย อำเภอดำเนินสะดวก จังหวัดราชบุรี
+    private static final double LOCKED_LAT = 13.524;
+    private static final double LOCKED_LON = 99.955;
+    private static final String LOCKED_LOCATION_NAME = "ตำบลดอนกรวย อำเภอดำเนินสะดวก จังหวัดราชบุรี";
+
+    private static final String WEATHER_FULL_URL =
+        "https://api.open-meteo.com/v1/forecast?latitude=" + LOCKED_LAT + "&longitude=" + LOCKED_LON +
+        "&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,surface_pressure" +
+        "&hourly=temperature_2m,precipitation_probability,weather_code" +
+        "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,uv_index_max,wind_speed_10m_max" +
+        "&timezone=Asia%2FBangkok&forecast_days=7";
+
     // ฟีดข่าว YouTube (ไทยรัฐนิวส์ + เรื่องเล่าเช้านี้)
     private static final String[] YT_NEWS_FEEDS = new String[]{
         "https://www.youtube.com/feeds/videos.xml?channel_id=UCrFDdD-EE05N7gjwZho2wqw",
@@ -107,11 +117,6 @@ public class MainActivity extends Activity {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private SharedPreferences prefs;
     private int currentTab = 0;
-
-    // พิกัดเริ่มต้น (ต.ดอนกรวย อ.ดำเนินสะดวก จ.ราชบุรี) และอัปเดตตามตำแหน่งจริงอัตโนมัติ
-    private double currentLat = 13.524;
-    private double currentLon = 99.955;
-    private String currentLocationName = "ต.ดอนกรวย อ.ดำเนินสะดวก จ.ราชบุรี";
     private String pendingIconTargetKey = null;
 
     @Override
@@ -122,13 +127,10 @@ public class MainActivity extends Activity {
                 WindowManager.LayoutParams.FLAG_FULLSCREEN);
 
         prefs = getSharedPreferences("FreeMyTVPrefs", Context.MODE_PRIVATE);
-        currentLat = Double.longBitsToDouble(prefs.getLong("lat_bits", Double.doubleToLongBits(13.524)));
-        currentLon = Double.longBitsToDouble(prefs.getLong("lon_bits", Double.doubleToLongBits(99.955)));
-        currentLocationName = prefs.getString("loc_name", "ต.ดอนกรวย อ.ดำเนินสะดวก จ.ราชบุรี");
 
         buildRootUI();
         startClockAndNetworkMonitor();
-        detectRealLocationAndFetchWeather();
+        fetchWeatherData();
         fetchEmbyData();
         fetchYoutubeNews();
     }
@@ -142,7 +144,7 @@ public class MainActivity extends Activity {
         fetchEmbyData();
     }
 
-    // ================= ระบบตั้งค่าลักษณะหน้าจอ (ขนาดอักษร, สีอักษร, ธีมมืด/สว่าง, วอลเปเปอร์) =================
+    // ================= ระบบตั้งค่าลักษณะหน้าจอ =================
     private float getFontScale() {
         return prefs.getFloat("ui_font_scale", 1.0f);
     }
@@ -195,19 +197,19 @@ public class MainActivity extends Activity {
             colors = new int[]{Color.parseColor("#F8FAFC"), Color.parseColor("#E2E8F0"), Color.parseColor("#CBD5E1")};
         } else {
             switch (preset) {
-                case 1: // Emerald Forest
+                case 1:
                     colors = new int[]{Color.parseColor("#064E3B"), Color.parseColor("#022C22"), Color.parseColor("#020617")};
                     break;
-                case 2: // Royal Purple
+                case 2:
                     colors = new int[]{Color.parseColor("#3B0764"), Color.parseColor("#1E1B4B"), Color.parseColor("#030712")};
                     break;
-                case 3: // Sunset Crimson
+                case 3:
                     colors = new int[]{Color.parseColor("#7F1D1D"), Color.parseColor("#1E1B4B"), Color.parseColor("#020617")};
                     break;
-                case 4: // Pure OLED Black
+                case 4:
                     colors = new int[]{Color.parseColor("#09090B"), Color.parseColor("#000000"), Color.parseColor("#000000")};
                     break;
-                default: // Midnight Blue
+                default:
                     colors = new int[]{Color.parseColor("#0B1120"), Color.parseColor("#0F172A"), Color.parseColor("#020617")};
                     break;
             }
@@ -226,7 +228,7 @@ public class MainActivity extends Activity {
         fetchYoutubeNews();
     }
 
-    // ================= สร้างโครงสร้างหน้าจอหลัก =================
+    // ================= สร้างโครงสร้างหน้าจอหลัก (จัดระเบียบแถบบนใหม่ไม่ให้ทับกันเด็ดขาด) =================
     private void buildRootUI() {
         rootScroll = new ScrollView(this);
         rootScroll.setFillViewport(true);
@@ -234,31 +236,27 @@ public class MainActivity extends Activity {
 
         LinearLayout masterLayout = new LinearLayout(this);
         masterLayout.setOrientation(LinearLayout.VERTICAL);
-        masterLayout.setPadding(dp(34), dp(20), dp(34), dp(32));
+        masterLayout.setPadding(dp(28), dp(18), dp(28), dp(30));
 
-        // ================= แถบด้านบนสุด (จัดกึ่งกลางเมนู Home/Movies/Weather แท้ด้วย FrameLayout) =================
-        FrameLayout topHeaderFrame = new FrameLayout(this);
-        topHeaderFrame.setLayoutParams(new LinearLayout.LayoutParams(
+        // แถบบนสุดแบ่งเป็น 3 โซนแบบ Weight สมดุล (ซ้าย 1 : กลาง Wrap : ขวา 1) ไม่มีทางทับซ้อนกัน
+        LinearLayout topHeaderRow = new LinearLayout(this);
+        topHeaderRow.setOrientation(LinearLayout.HORIZONTAL);
+        topHeaderRow.setGravity(Gravity.CENTER_VERTICAL);
+        topHeaderRow.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // 1. กลุ่มปุ่มเครื่องมือฝั่งซ้าย (เพิ่มปุ่ม "🎨 ตั้งค่าหน้าจอ" ในกรอบสีฟ้าตามรูปที่ 2)
-        LinearLayout leftTools = new LinearLayout(this);
-        leftTools.setOrientation(LinearLayout.HORIZONTAL);
-        leftTools.setGravity(Gravity.CENTER_VERTICAL);
+        // 1. โซนซ้าย (ตัดปุ่ม "แอปทั้งหมด" ออก เหลือ 3 ปุ่มขนาดกะทัดรัด)
+        LinearLayout leftZone = new LinearLayout(this);
+        leftZone.setOrientation(LinearLayout.HORIZONTAL);
+        leftZone.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
 
-        leftTools.addView(createToolButton("📱 แอปทั้งหมด", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                showAllAppsDialog();
-            }
-        }));
-        leftTools.addView(createToolButton("🎬 ตั้งค่า Emby", new View.OnClickListener() {
+        leftZone.addView(createToolButton("🎬 ตั้งค่า Emby", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 showEmbyConfigDialog();
             }
         }));
-        leftTools.addView(createToolButton("⚙️ ตั้งค่าทีวี", new View.OnClickListener() {
+        leftZone.addView(createToolButton("⚙️ ตั้งค่าทีวี", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 try {
@@ -266,20 +264,16 @@ public class MainActivity extends Activity {
                 } catch (Exception ignored) {}
             }
         }));
-        // ปุ่มกรอบสีฟ้าตามรูปที่ 2: การตั้งค่าลักษณะหน้าจอ
-        leftTools.addView(createToolButton("🎨 ตั้งค่าหน้าจอ", new View.OnClickListener() {
+        leftZone.addView(createToolButton("🎨 ตั้งค่าหน้าจอ", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 showAppearanceSettingsDialog();
             }
         }));
 
-        FrameLayout.LayoutParams leftLp = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.START | Gravity.CENTER_VERTICAL);
-        topHeaderFrame.addView(leftTools, leftLp);
+        topHeaderRow.addView(leftZone, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
-        // 2. หมวดหมู่ Home | Movies | Weather อยู่ตรงกลางหน้าจอเป๊ะ (ตามรูปที่ 1)
+        // 2. โซนกลาง: หมวดหมู่ Home | Movies | Weather อยู่กึ่งกลางหน้าจอและมีระยะห่างปลอดภัย
         LinearLayout navPillBar = new LinearLayout(this);
         navPillBar.setOrientation(LinearLayout.HORIZONTAL);
         navPillBar.setGravity(Gravity.CENTER);
@@ -298,21 +292,20 @@ public class MainActivity extends Activity {
         navPillBar.addView(tabMoviesBtn);
         navPillBar.addView(tabWeatherBtn);
 
-        FrameLayout.LayoutParams centerLp = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.CENTER);
-        topHeaderFrame.addView(navPillBar, centerLp);
+        LinearLayout.LayoutParams centerLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        centerLp.setMargins(dp(12), 0, dp(12), 0);
+        topHeaderRow.addView(navPillBar, centerLp);
 
-        // 3. ฝั่งขวา: สถานะไอคอน Wi-Fi (กรอบสีแดงรูปที่ 2) + เวลาและวันที่
-        LinearLayout rightStatusCluster = new LinearLayout(this);
-        rightStatusCluster.setOrientation(LinearLayout.HORIZONTAL);
-        rightStatusCluster.setGravity(Gravity.CENTER_VERTICAL);
+        // 3. โซนขวา: สถานะไอคอน Wi-Fi + เวลาและวันที่
+        LinearLayout rightZone = new LinearLayout(this);
+        rightZone.setOrientation(LinearLayout.HORIZONTAL);
+        rightZone.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
 
-        // กล่องไอคอนสถานะ Wi-Fi กดคลิกเพื่อเข้าตั้งค่า Wi-Fi ได้
         LinearLayout wifiBadge = new LinearLayout(this);
         wifiBadge.setOrientation(LinearLayout.HORIZONTAL);
         wifiBadge.setGravity(Gravity.CENTER_VERTICAL);
-        wifiBadge.setPadding(dp(12), dp(6), dp(12), dp(6));
+        wifiBadge.setPadding(dp(10), dp(6), dp(10), dp(6));
         wifiBadge.setFocusable(true);
         wifiBadge.setClickable(true);
 
@@ -347,29 +340,28 @@ public class MainActivity extends Activity {
         });
 
         wifiIconView = new WifiSignalView(this);
-        LinearLayout.LayoutParams wifiIconLp = new LinearLayout.LayoutParams(dp(24), dp(20));
+        LinearLayout.LayoutParams wifiIconLp = new LinearLayout.LayoutParams(dp(22), dp(18));
         wifiBadge.addView(wifiIconView, wifiIconLp);
 
         wifiStatusText = new TextView(this);
         wifiStatusText.setTextColor(getPrimaryTextColor());
         setScaledTextSize(wifiStatusText, 11);
         wifiStatusText.setTypeface(null, Typeface.BOLD);
-        wifiStatusText.setPadding(dp(8), 0, 0, 0);
+        wifiStatusText.setPadding(dp(6), 0, 0, 0);
         wifiBadge.addView(wifiStatusText);
 
         LinearLayout.LayoutParams wifiBadgeLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        wifiBadgeLp.setMargins(0, 0, dp(16), 0);
-        rightStatusCluster.addView(wifiBadge, wifiBadgeLp);
+        wifiBadgeLp.setMargins(0, 0, dp(14), 0);
+        rightZone.addView(wifiBadge, wifiBadgeLp);
 
-        // กล่องเวลาและวันที่
         LinearLayout clockBox = new LinearLayout(this);
         clockBox.setOrientation(LinearLayout.VERTICAL);
         clockBox.setGravity(Gravity.END);
 
         clockView = new TextView(this);
         clockView.setTextColor(getPrimaryTextColor());
-        setScaledTextSize(clockView, 26);
+        setScaledTextSize(clockView, 25);
         clockView.setTypeface(null, Typeface.BOLD);
         clockBox.addView(clockView);
 
@@ -379,14 +371,10 @@ public class MainActivity extends Activity {
         dateView.setTypeface(null, Typeface.BOLD);
         clockBox.addView(dateView);
 
-        rightStatusCluster.addView(clockBox);
+        rightZone.addView(clockBox);
+        topHeaderRow.addView(rightZone, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
-        FrameLayout.LayoutParams rightLp = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.END | Gravity.CENTER_VERTICAL);
-        topHeaderFrame.addView(rightStatusCluster, rightLp);
-
-        masterLayout.addView(topHeaderFrame);
+        masterLayout.addView(topHeaderRow);
 
         // ================= พื้นที่เนื้อหาแต่ละหน้า =================
         FrameLayout pagesContainer = new FrameLayout(this);
@@ -420,7 +408,7 @@ public class MainActivity extends Activity {
 
     // ================= สร้างหน้า HOME =================
     private void buildHomePage() {
-        // 1. กล่องพยากรณ์อากาศ 7 วันเต็มความกว้าง + อ้างอิงตำแหน่งจริง (ตามรูปที่ 1)
+        // 1. กล่องพยากรณ์อากาศ 7 วันเต็มความกว้าง ล็อกพิกัด ต.ดอนกรวย อ.ดำเนินสะดวก จ.ราชบุรี
         LinearLayout weatherCard = new LinearLayout(this);
         weatherCard.setOrientation(LinearLayout.VERTICAL);
         weatherCard.setPadding(dp(18), dp(12), dp(18), dp(14));
@@ -435,20 +423,20 @@ public class MainActivity extends Activity {
         locHeaderRow.setGravity(Gravity.CENTER_VERTICAL);
 
         locationTitleView = new TextView(this);
-        locationTitleView.setText("📍 ตำแหน่งปัจจุบัน: " + currentLocationName + " (พยากรณ์ล่วงหน้า 7 วัน)");
+        locationTitleView.setText("📍 " + LOCKED_LOCATION_NAME + " (พยากรณ์ล่วงหน้า 7 วัน)");
         locationTitleView.setTextColor(getPrimaryTextColor());
         setScaledTextSize(locationTitleView, 13);
         locationTitleView.setTypeface(null, Typeface.BOLD);
         locHeaderRow.addView(locationTitleView, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
-        TextView refreshLocBtn = createToolButton("🔄 อัปเดตพิกัดจริง", new View.OnClickListener() {
+        TextView refreshWeatherBtn = createToolButton("🔄 รีเฟรชอากาศ", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                Toast.makeText(MainActivity.this, "กำลังค้นหาตำแหน่งปัจจุบัน...", Toast.LENGTH_SHORT).show();
-                detectRealLocationAndFetchWeather();
+                Toast.makeText(MainActivity.this, "กำลังอัปเดตพยากรณ์อากาศ ต.ดอนกรวย...", Toast.LENGTH_SHORT).show();
+                fetchWeatherData();
             }
         });
-        locHeaderRow.addView(refreshLocBtn);
+        locHeaderRow.addView(refreshWeatherBtn);
         weatherCard.addView(locHeaderRow);
 
         homeWeatherRow = new LinearLayout(this);
@@ -462,7 +450,7 @@ public class MainActivity extends Activity {
         wcLp.setMargins(0, 0, 0, dp(16));
         pageHome.addView(weatherCard, wcLp);
 
-        // 2. ถาดแอปหลักทั้ง 4 (พื้นหลังขาว ไอคอนใหญ่ + กดค้างเพื่อสลับ/เปลี่ยนชื่อ/เปลี่ยนไอคอนได้)
+        // 2. ถาดแอปหลักทั้ง 4
         mainAppsContainer = new LinearLayout(this);
         mainAppsContainer.setOrientation(LinearLayout.HORIZONTAL);
         mainAppsContainer.setWeightSum(4.0f);
@@ -477,7 +465,7 @@ public class MainActivity extends Activity {
         renderMainFourApps();
         pageHome.addView(mainAppsContainer);
 
-        // 3. แถบแสดงแอปทั้งหมดที่มีในเครื่อง (ขนาดเล็กกว่าแอปหลักพอสมควร ตามรูปที่ 3)
+        // 3. แถบแสดงแอปทั้งหมดที่มีในเครื่อง
         pageHome.addView(createSectionHeader("📲 แอปทั้งหมดที่มีในเครื่อง (กดค้างที่แอปเพื่อจัดเรียง / ตั้งค่า)"));
         HorizontalScrollView allAppsScroll = new HorizontalScrollView(this);
         allAppsScroll.setHorizontalScrollBarEnabled(false);
@@ -506,7 +494,7 @@ public class MainActivity extends Activity {
         pageHome.addView(ytScroll);
     }
 
-    // ================= วาดแอปหลัก 4 แอป (รองรับสลับตำแหน่ง, เปลี่ยนชื่อ, เปลี่ยนไอคอน) =================
+    // ================= วาดแอปหลัก 4 แอป =================
     private List<String> getMainAppSlotsOrder() {
         String saved = prefs.getString("main_slots_order", "youtube,emby,trueid,tvbro");
         return new ArrayList<String>(Arrays.asList(saved.split(",")));
@@ -628,7 +616,7 @@ public class MainActivity extends Activity {
         return tile;
     }
 
-    // ================= วาดแถบแอปทั้งหมดในเครื่อง (ขนาดเล็กกว่าแอปหลัก ตามรูปที่ 3) =================
+    // ================= วาดแถบแอปทั้งหมดในเครื่อง =================
     private static class AppEntry {
         String pkg;
         String label;
@@ -755,7 +743,6 @@ public class MainActivity extends Activity {
 
     private View buildAppIconView(String customKey, String[] pkgCandidates, String keyword,
                                   String fallbackColor, String fallbackText, int sizePx) {
-        // 1. ตรวจสอบว่าผู้ใช้ตั้งไอคอนรูปภาพเองหรือไม่
         File customIconFile = new File(getFilesDir(), "icon_" + customKey.replaceAll("[^a-zA-Z0-9]", "_") + ".png");
         String iconPreset = prefs.getString("custom_icon_preset_" + customKey, "");
 
@@ -785,7 +772,6 @@ public class MainActivity extends Activity {
             return badge;
         }
 
-        // 2. ดึงไอคอนจริงจากระบบ
         Drawable sysIcon = findAppIcon(pkgCandidates, keyword);
         if (sysIcon != null) {
             ImageView iv = new ImageView(this);
@@ -795,7 +781,6 @@ public class MainActivity extends Activity {
             return iv;
         }
 
-        // 3. ไอคอนสำรองกรณีไม่พบแอปในเครื่องเทส
         TextView badge = new TextView(this);
         badge.setText(fallbackText);
         badge.setTextColor(Color.WHITE);
@@ -811,7 +796,7 @@ public class MainActivity extends Activity {
         return badge;
     }
 
-    // ================= ข้อ 5: เมนูลอยเมื่อกดค้างที่ตัวแอป =================
+    // ================= เมนูลอยเมื่อกดค้างที่ตัวแอป =================
     private void showAppLongPressMenu(final String appTitle, final String packageName, final String customKey,
                                       final boolean isMainFourSlot, final int currentIndex) {
         final String[] options = new String[]{
@@ -1028,7 +1013,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ================= ข้อ 3: เมนูการตั้งค่าลักษณะหน้าจอ (กรอบสีฟ้า รูปที่ 2) =================
+    // ================= เมนูการตั้งค่าลักษณะหน้าจอ =================
     private void showAppearanceSettingsDialog() {
         final AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         int curVol = am != null ? am.getStreamVolume(AudioManager.STREAM_MUSIC) : 0;
@@ -1243,9 +1228,9 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ================= ข้อ 2: วาดไอคอนสถานะ Wi-Fi แบบเรียลไทม์ =================
+    // ================= ไอคอนสถานะ Wi-Fi =================
     private static class WifiSignalView extends View {
-        private int level = 4; // 0 = disconnected, 1..4 = bars
+        private int level = 4;
         private boolean connected = true;
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final RectF arcRect = new RectF();
@@ -1271,12 +1256,10 @@ public class MainActivity extends Activity {
             int activeColor = connected ? Color.parseColor("#38BDF8") : Color.parseColor("#EF4444");
             int dimColor = Color.parseColor("#475569");
 
-            // จุดกลมด้านล่างสุด
             paint.setStyle(Paint.Style.FILL);
             paint.setColor(connected && level >= 1 ? activeColor : dimColor);
             canvas.drawCircle(cx, cy, w * 0.08f, paint);
 
-            // เส้นโค้งคลื่น Wi-Fi 3 ชั้น
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(w * 0.09f);
             paint.setStrokeCap(Paint.Cap.ROUND);
@@ -1321,89 +1304,13 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ================= ข้อ 1: ระบบตรวจหาตำแหน่งจริงอัตโนมัติ + พยากรณ์อากาศ 7 วัน =================
-    private void detectRealLocationAndFetchWeather() {
-        executor.execute(new Runnable() {
-            @Override
-            public void run() {
-                boolean updated = false;
-                // 1. ลองดึงจาก LocationManager ของระบบ Android หากมีสิทธิ์
-                try {
-                    LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-                    if (lm != null) {
-                        Location loc = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
-                        if (loc == null) loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-                        if (loc != null) {
-                            currentLat = loc.getLatitude();
-                            currentLon = loc.getLongitude();
-                            updated = true;
-                        }
-                    }
-                } catch (SecurityException ignored) {}
-
-                // 2. ดึงตำแหน่งจริงจาก IP Geolocation และแปลงพิกัดเป็นชื่อตำบล/อำเภอ/จังหวัดภาษาไทย
-                try {
-                    if (!updated) {
-                        String ipJsonStr = httpGet("https://ipwho.is/");
-                        JSONObject ipObj = new JSONObject(ipJsonStr);
-                        if (ipObj.optBoolean("success", false)) {
-                            currentLat = ipObj.optDouble("latitude", currentLat);
-                            currentLon = ipObj.optDouble("longitude", currentLon);
-                        }
-                    }
-
-                    // แปลงพิกัด (Reverse Geocoding) เป็นชื่อพื้นที่ภาษาไทย
-                    String geoUrl = "https://nominatim.openstreetmap.org/reverse?format=json&lat="
-                            + currentLat + "&lon=" + currentLon + "&zoom=14&accept-language=th";
-                    String geoResp = httpGet(geoUrl);
-                    JSONObject geoObj = new JSONObject(geoResp);
-                    JSONObject addr = geoObj.optJSONObject("address");
-                    if (addr != null) {
-                        String suburb = addr.optString("suburb", addr.optString("village", addr.optString("tambon", "")));
-                        String city = addr.optString("city", addr.optString("town", addr.optString("county", addr.optString("amphoe", ""))));
-                        String state = addr.optString("state", addr.optString("province", ""));
-                        StringBuilder sb = new StringBuilder();
-                        if (!TextUtils.isEmpty(suburb)) sb.append(suburb).append(" ");
-                        if (!TextUtils.isEmpty(city)) sb.append(city).append(" ");
-                        if (!TextUtils.isEmpty(state)) sb.append(state);
-                        String resolvedName = sb.toString().trim();
-                        if (!TextUtils.isEmpty(resolvedName)) {
-                            currentLocationName = resolvedName;
-                        }
-                    }
-
-                    prefs.edit()
-                            .putLong("lat_bits", Double.doubleToLongBits(currentLat))
-                            .putLong("lon_bits", Double.doubleToLongBits(currentLon))
-                            .putString("loc_name", currentLocationName)
-                            .apply();
-                } catch (Exception ignored) {}
-
-                mainHandler.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (locationTitleView != null) {
-                            locationTitleView.setText("📍 ตำแหน่งปัจจุบัน: " + currentLocationName + " (พยากรณ์ล่วงหน้า 7 วัน)");
-                        }
-                        fetchWeatherData();
-                    }
-                });
-            }
-        });
-    }
-
+    // ================= ดึงพยากรณ์อากาศ 7 วัน (ล็อกพิกัด ต.ดอนกรวย อ.ดำเนินสะดวก จ.ราชบุรี) =================
     private void fetchWeatherData() {
         executor.execute(new Runnable() {
             @Override
             public void run() {
                 try {
-                    String weatherUrl = "https://api.open-meteo.com/v1/forecast?latitude=" + currentLat + "&longitude=" + currentLon +
-                            "&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,surface_pressure" +
-                            "&hourly=temperature_2m,precipitation_probability,weather_code" +
-                            "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,uv_index_max,wind_speed_10m_max" +
-                            "&timezone=Asia%2FBangkok&forecast_days=7";
-
-                    String jsonStr = httpGet(weatherUrl);
+                    String jsonStr = httpGet(WEATHER_FULL_URL);
                     final JSONObject root = new JSONObject(jsonStr);
                     final JSONObject current = root.optJSONObject("current");
                     final JSONObject hourly = root.optJSONObject("hourly");
@@ -1439,7 +1346,6 @@ public class MainActivity extends Activity {
         });
     }
 
-    // แสดงพยากรณ์อากาศ 7 วันเรียงกันเต็มกรอบสีเขียวในหน้า Home (ตามรูปที่ 1)
     private void renderHomeWeather7Days(JSONObject daily) {
         if (homeWeatherRow == null) return;
         homeWeatherRow.removeAllViews();
@@ -1556,7 +1462,7 @@ public class MainActivity extends Activity {
         leftHero.setOrientation(LinearLayout.VERTICAL);
 
         TextView locHeader = new TextView(this);
-        locHeader.setText("📍 พิกัดอ้างอิงจริง: " + currentLocationName);
+        locHeader.setText("📍 " + LOCKED_LOCATION_NAME);
         locHeader.setTextColor(Color.parseColor("#BAE6FD"));
         setScaledTextSize(locHeader, 16);
         locHeader.setTypeface(null, Typeface.BOLD);
@@ -1903,7 +1809,7 @@ public class MainActivity extends Activity {
                     conn.setReadTimeout(6000);
                     conn.setRequestProperty("Content-Type", "application/json");
                     conn.setRequestProperty("X-Emby-Authorization",
-                            "MediaBrowser Client=\"FreeMyTV\", Device=\"MiBoxS2\", DeviceId=\"miboxs2-custom\", Version=\"3.0.0\"");
+                            "MediaBrowser Client=\"FreeMyTV\", Device=\"MiBoxS2\", DeviceId=\"miboxs2-custom\", Version=\"4.0.0\"");
                     conn.setDoOutput(true);
 
                     JSONObject payload = new JSONObject();
@@ -2098,7 +2004,7 @@ public class MainActivity extends Activity {
         tv.setText(text);
         setScaledTextSize(tv, 14);
         tv.setTypeface(null, Typeface.BOLD);
-        tv.setPadding(dp(20), dp(7), dp(20), dp(7));
+        tv.setPadding(dp(18), dp(6), dp(18), dp(6));
         tv.setFocusable(true);
         tv.setClickable(true);
 
@@ -2199,6 +2105,7 @@ public class MainActivity extends Activity {
         tv.setTextColor(getPrimaryTextColor());
         setScaledTextSize(tv, 11);
         tv.setTypeface(null, Typeface.BOLD);
+        tv.setSingleLine(true);
         tv.setPadding(dp(10), dp(6), dp(10), dp(6));
         tv.setFocusable(true);
         tv.setClickable(true);
@@ -2265,24 +2172,6 @@ public class MainActivity extends Activity {
                     }
                 })
                 .setNegativeButton("ยกเลิก", null)
-                .show();
-    }
-
-    private void showAllAppsDialog() {
-        final List<AppEntry> apps = getOrderedInstalledApps();
-        String[] names = new String[apps.size()];
-        for (int i = 0; i < apps.size(); i++) {
-            names[i] = apps.get(i).label;
-        }
-        new AlertDialog.Builder(this)
-                .setTitle("แอปทั้งหมดในเครื่อง (กดค้างที่แถบหน้าหลักเพื่อตั้งค่าแอปได้)")
-                .setItems(names, new DialogInterface.OnClickListener() {
-                    @Override
-                    public void onClick(DialogInterface d, int which) {
-                        AppEntry e = apps.get(which);
-                        launchApp(new String[]{e.pkg}, "", e.label);
-                    }
-                })
                 .show();
     }
 
@@ -2451,7 +2340,7 @@ public class MainActivity extends Activity {
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setConnectTimeout(6000);
         conn.setReadTimeout(6000);
-        conn.setRequestProperty("User-Agent", "FreeMyTV-AndroidTV/3.0");
+        conn.setRequestProperty("User-Agent", "FreeMyTV-AndroidTV/4.0");
         return readStream(conn.getInputStream());
     }
 
