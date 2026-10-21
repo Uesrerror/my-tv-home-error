@@ -10,14 +10,26 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.location.Location;
+import android.location.LocationManager;
+import android.media.AudioManager;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
 import android.net.Uri;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -38,6 +50,8 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -45,7 +59,10 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Calendar;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -54,13 +71,8 @@ import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
 
-    // พิกัด ต.ดอนกรวย อ.ดำเนินสะดวก จ.ราชบุรี (ดึงข้อมูลปัจจุบัน + รายชั่วโมง + ล่วงหน้า 7 วัน)
-    private static final String WEATHER_FULL_URL =
-        "https://api.open-meteo.com/v1/forecast?latitude=13.524&longitude=99.955" +
-        "&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,surface_pressure" +
-        "&hourly=temperature_2m,precipitation_probability,weather_code" +
-        "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,uv_index_max,wind_speed_10m_max" +
-        "&timezone=Asia%2FBangkok&forecast_days=7";
+    private static final int REQ_PICK_WALLPAPER = 1001;
+    private static final int REQ_PICK_APP_ICON = 1002;
 
     // ฟีดข่าว YouTube (ไทยรัฐนิวส์ + เรื่องเล่าเช้านี้)
     private static final String[] YT_NEWS_FEEDS = new String[]{
@@ -68,8 +80,13 @@ public class MainActivity extends Activity {
         "https://www.youtube.com/feeds/videos.xml?channel_id=UC5wKpLWxAZBZrunls3mzwEw"
     };
 
+    private ScrollView rootScroll;
     private TextView clockView;
     private TextView dateView;
+    private TextView wifiStatusText;
+    private WifiSignalView wifiIconView;
+    private TextView locationTitleView;
+
     private TextView tabHomeBtn;
     private TextView tabMoviesBtn;
     private TextView tabWeatherBtn;
@@ -79,6 +96,8 @@ public class MainActivity extends Activity {
     private LinearLayout pageWeather;
 
     private LinearLayout homeWeatherRow;
+    private LinearLayout mainAppsContainer;
+    private LinearLayout allAppsRowContainer;
     private LinearLayout homeEmbyRow;
     private LinearLayout homeYoutubeRow;
     private LinearLayout moviesCategoriesContainer;
@@ -87,7 +106,13 @@ public class MainActivity extends Activity {
     private final ExecutorService executor = Executors.newCachedThreadPool();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private SharedPreferences prefs;
-    private int currentTab = 0; // 0 = Home, 1 = Movies, 2 = Weather
+    private int currentTab = 0;
+
+    // พิกัดเริ่มต้น (ต.ดอนกรวย อ.ดำเนินสะดวก จ.ราชบุรี) และอัปเดตตามตำแหน่งจริงอัตโนมัติ
+    private double currentLat = 13.524;
+    private double currentLon = 99.955;
+    private String currentLocationName = "ต.ดอนกรวย อ.ดำเนินสะดวก จ.ราชบุรี";
+    private String pendingIconTargetKey = null;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -97,45 +122,130 @@ public class MainActivity extends Activity {
                 WindowManager.LayoutParams.FLAG_FULLSCREEN);
 
         prefs = getSharedPreferences("FreeMyTVPrefs", Context.MODE_PRIVATE);
+        currentLat = Double.longBitsToDouble(prefs.getLong("lat_bits", Double.doubleToLongBits(13.524)));
+        currentLon = Double.longBitsToDouble(prefs.getLong("lon_bits", Double.doubleToLongBits(99.955)));
+        currentLocationName = prefs.getString("loc_name", "ต.ดอนกรวย อ.ดำเนินสะดวก จ.ราชบุรี");
+
         buildRootUI();
-        startClockAndDate();
-        refreshAllData();
+        startClockAndNetworkMonitor();
+        detectRealLocationAndFetchWeather();
+        fetchEmbyData();
+        fetchYoutubeNews();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        refreshAllData();
+        updateWifiIndicator();
+        renderAllAppsRow();
+        fetchWeatherData();
+        fetchEmbyData();
     }
 
-    private void refreshAllData() {
+    // ================= ระบบตั้งค่าลักษณะหน้าจอ (ขนาดอักษร, สีอักษร, ธีมมืด/สว่าง, วอลเปเปอร์) =================
+    private float getFontScale() {
+        return prefs.getFloat("ui_font_scale", 1.0f);
+    }
+
+    private boolean isLightTheme() {
+        return prefs.getBoolean("ui_light_theme", false);
+    }
+
+    private int getPrimaryTextColor() {
+        String customHex = prefs.getString("ui_text_color", "");
+        if (!TextUtils.isEmpty(customHex)) {
+            try {
+                return Color.parseColor(customHex);
+            } catch (Exception ignored) {}
+        }
+        return isLightTheme() ? Color.parseColor("#0F172A") : Color.WHITE;
+    }
+
+    private int getSecondaryTextColor() {
+        return isLightTheme() ? Color.parseColor("#334155") : Color.parseColor("#CBD5E1");
+    }
+
+    private int getCardBgColor() {
+        return isLightTheme() ? Color.parseColor("#CCFFFFFF") : Color.parseColor("#771E293B");
+    }
+
+    private int getCardStrokeColor() {
+        return isLightTheme() ? Color.parseColor("#9994A3B8") : Color.parseColor("#4D94A3B8");
+    }
+
+    private void setScaledTextSize(TextView tv, float baseSp) {
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, baseSp * getFontScale());
+    }
+
+    private void applyWallpaperToRoot() {
+        if (rootScroll == null) return;
+        File customWall = new File(getFilesDir(), "custom_wallpaper.jpg");
+        int preset = prefs.getInt("ui_wallpaper_preset", 0);
+
+        if (preset == 99 && customWall.exists()) {
+            Bitmap bmp = BitmapFactory.decodeFile(customWall.getAbsolutePath());
+            if (bmp != null) {
+                rootScroll.setBackground(new BitmapDrawable(getResources(), bmp));
+                return;
+            }
+        }
+
+        int[] colors;
+        if (isLightTheme()) {
+            colors = new int[]{Color.parseColor("#F8FAFC"), Color.parseColor("#E2E8F0"), Color.parseColor("#CBD5E1")};
+        } else {
+            switch (preset) {
+                case 1: // Emerald Forest
+                    colors = new int[]{Color.parseColor("#064E3B"), Color.parseColor("#022C22"), Color.parseColor("#020617")};
+                    break;
+                case 2: // Royal Purple
+                    colors = new int[]{Color.parseColor("#3B0764"), Color.parseColor("#1E1B4B"), Color.parseColor("#030712")};
+                    break;
+                case 3: // Sunset Crimson
+                    colors = new int[]{Color.parseColor("#7F1D1D"), Color.parseColor("#1E1B4B"), Color.parseColor("#020617")};
+                    break;
+                case 4: // Pure OLED Black
+                    colors = new int[]{Color.parseColor("#09090B"), Color.parseColor("#000000"), Color.parseColor("#000000")};
+                    break;
+                default: // Midnight Blue
+                    colors = new int[]{Color.parseColor("#0B1120"), Color.parseColor("#0F172A"), Color.parseColor("#020617")};
+                    break;
+            }
+        }
+        GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.TL_BR, colors);
+        rootScroll.setBackground(bg);
+    }
+
+    private void rebuildEntireScreen() {
+        int savedTab = currentTab;
+        buildRootUI();
+        switchTab(savedTab);
+        updateWifiIndicator();
         fetchWeatherData();
         fetchEmbyData();
         fetchYoutubeNews();
     }
 
+    // ================= สร้างโครงสร้างหน้าจอหลัก =================
     private void buildRootUI() {
-        ScrollView rootScroll = new ScrollView(this);
+        rootScroll = new ScrollView(this);
         rootScroll.setFillViewport(true);
-        GradientDrawable bg = new GradientDrawable(
-                GradientDrawable.Orientation.TL_BR,
-                new int[]{Color.parseColor("#0B1120"), Color.parseColor("#0F172A"), Color.parseColor("#020617")}
-        );
-        rootScroll.setBackground(bg);
+        applyWallpaperToRoot();
 
         LinearLayout masterLayout = new LinearLayout(this);
         masterLayout.setOrientation(LinearLayout.VERTICAL);
-        masterLayout.setPadding(dp(36), dp(22), dp(36), dp(32));
+        masterLayout.setPadding(dp(34), dp(20), dp(34), dp(32));
 
-        // ================= แถบเมนูด้านบนสุด (Top Navigation Bar + เวลาและวันที่) =================
-        LinearLayout topNavRow = new LinearLayout(this);
-        topNavRow.setOrientation(LinearLayout.HORIZONTAL);
-        topNavRow.setGravity(Gravity.CENTER_VERTICAL);
+        // ================= แถบด้านบนสุด (จัดกึ่งกลางเมนู Home/Movies/Weather แท้ด้วย FrameLayout) =================
+        FrameLayout topHeaderFrame = new FrameLayout(this);
+        topHeaderFrame.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // ฝั่งซ้าย: ปุ่มเครื่องมือด่วน
+        // 1. กลุ่มปุ่มเครื่องมือฝั่งซ้าย (เพิ่มปุ่ม "🎨 ตั้งค่าหน้าจอ" ในกรอบสีฟ้าตามรูปที่ 2)
         LinearLayout leftTools = new LinearLayout(this);
         leftTools.setOrientation(LinearLayout.HORIZONTAL);
         leftTools.setGravity(Gravity.CENTER_VERTICAL);
+
         leftTools.addView(createToolButton("📱 แอปทั้งหมด", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -152,24 +262,32 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 try {
-                    startActivity(new Intent(android.provider.Settings.ACTION_SETTINGS));
+                    startActivity(new Intent(Settings.ACTION_SETTINGS));
                 } catch (Exception ignored) {}
             }
         }));
-        topNavRow.addView(leftTools);
+        // ปุ่มกรอบสีฟ้าตามรูปที่ 2: การตั้งค่าลักษณะหน้าจอ
+        leftTools.addView(createToolButton("🎨 ตั้งค่าหน้าจอ", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showAppearanceSettingsDialog();
+            }
+        }));
 
-        // พื้นที่ดันให้เมนูหมวดหมู่อยู่กึ่งกลางจอ
-        View leftSpacer = new View(this);
-        topNavRow.addView(leftSpacer, new LinearLayout.LayoutParams(0, 1, 1.0f));
-                // ตรงกลาง: หมวดหมู่ Home | Movies | Weather (ตามรูปที่ 3)
+        FrameLayout.LayoutParams leftLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.START | Gravity.CENTER_VERTICAL);
+        topHeaderFrame.addView(leftTools, leftLp);
+
+        // 2. หมวดหมู่ Home | Movies | Weather อยู่ตรงกลางหน้าจอเป๊ะ (ตามรูปที่ 1)
         LinearLayout navPillBar = new LinearLayout(this);
         navPillBar.setOrientation(LinearLayout.HORIZONTAL);
         navPillBar.setGravity(Gravity.CENTER);
         navPillBar.setPadding(dp(6), dp(4), dp(6), dp(4));
         GradientDrawable navBarBg = new GradientDrawable();
-        navBarBg.setColor(Color.parseColor("#801E293B"));
+        navBarBg.setColor(getCardBgColor());
         navBarBg.setCornerRadius(dp(24));
-        navBarBg.setStroke(dp(1), Color.parseColor("#33FFFFFF"));
+        navBarBg.setStroke(dp(1), getCardStrokeColor());
         navPillBar.setBackground(navBarBg);
 
         tabHomeBtn = createNavTabButton("Home", 0);
@@ -179,36 +297,102 @@ public class MainActivity extends Activity {
         navPillBar.addView(tabHomeBtn);
         navPillBar.addView(tabMoviesBtn);
         navPillBar.addView(tabWeatherBtn);
-        topNavRow.addView(navPillBar);
 
-        View rightSpacer = new View(this);
-        topNavRow.addView(rightSpacer, new LinearLayout.LayoutParams(0, 1, 1.0f));
+        FrameLayout.LayoutParams centerLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER);
+        topHeaderFrame.addView(navPillBar, centerLp);
 
-        // ฝั่งขวา: เวลา + วันที่ภาษาไทย
+        // 3. ฝั่งขวา: สถานะไอคอน Wi-Fi (กรอบสีแดงรูปที่ 2) + เวลาและวันที่
+        LinearLayout rightStatusCluster = new LinearLayout(this);
+        rightStatusCluster.setOrientation(LinearLayout.HORIZONTAL);
+        rightStatusCluster.setGravity(Gravity.CENTER_VERTICAL);
+
+        // กล่องไอคอนสถานะ Wi-Fi กดคลิกเพื่อเข้าตั้งค่า Wi-Fi ได้
+        LinearLayout wifiBadge = new LinearLayout(this);
+        wifiBadge.setOrientation(LinearLayout.HORIZONTAL);
+        wifiBadge.setGravity(Gravity.CENTER_VERTICAL);
+        wifiBadge.setPadding(dp(12), dp(6), dp(12), dp(6));
+        wifiBadge.setFocusable(true);
+        wifiBadge.setClickable(true);
+
+        final GradientDrawable wifiNormalBg = new GradientDrawable();
+        wifiNormalBg.setColor(getCardBgColor());
+        wifiNormalBg.setCornerRadius(dp(18));
+        wifiNormalBg.setStroke(dp(1), getCardStrokeColor());
+
+        final GradientDrawable wifiFocusBg = new GradientDrawable();
+        wifiFocusBg.setColor(Color.parseColor("#2563EB"));
+        wifiFocusBg.setCornerRadius(dp(18));
+        wifiFocusBg.setStroke(dp(2), Color.WHITE);
+
+        wifiBadge.setBackground(wifiNormalBg);
+        wifiBadge.setOnFocusChangeListener(new View.OnFocusChangeListener() {
+            @Override
+            public void onFocusChange(View v, boolean hasFocus) {
+                v.setBackground(hasFocus ? wifiFocusBg : wifiNormalBg);
+            }
+        });
+        wifiBadge.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                try {
+                    startActivity(new Intent(Settings.ACTION_WIFI_SETTINGS));
+                } catch (Exception e) {
+                    try {
+                        startActivity(new Intent(Settings.ACTION_SETTINGS));
+                    } catch (Exception ignored) {}
+                }
+            }
+        });
+
+        wifiIconView = new WifiSignalView(this);
+        LinearLayout.LayoutParams wifiIconLp = new LinearLayout.LayoutParams(dp(24), dp(20));
+        wifiBadge.addView(wifiIconView, wifiIconLp);
+
+        wifiStatusText = new TextView(this);
+        wifiStatusText.setTextColor(getPrimaryTextColor());
+        setScaledTextSize(wifiStatusText, 11);
+        wifiStatusText.setTypeface(null, Typeface.BOLD);
+        wifiStatusText.setPadding(dp(8), 0, 0, 0);
+        wifiBadge.addView(wifiStatusText);
+
+        LinearLayout.LayoutParams wifiBadgeLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        wifiBadgeLp.setMargins(0, 0, dp(16), 0);
+        rightStatusCluster.addView(wifiBadge, wifiBadgeLp);
+
+        // กล่องเวลาและวันที่
         LinearLayout clockBox = new LinearLayout(this);
         clockBox.setOrientation(LinearLayout.VERTICAL);
         clockBox.setGravity(Gravity.END);
 
         clockView = new TextView(this);
-        clockView.setTextColor(Color.WHITE);
-        clockView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
+        clockView.setTextColor(getPrimaryTextColor());
+        setScaledTextSize(clockView, 26);
         clockView.setTypeface(null, Typeface.BOLD);
         clockBox.addView(clockView);
 
         dateView = new TextView(this);
-        dateView.setTextColor(Color.parseColor("#94A3B8"));
-        dateView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        dateView.setTextColor(getSecondaryTextColor());
+        setScaledTextSize(dateView, 11);
         dateView.setTypeface(null, Typeface.BOLD);
         clockBox.addView(dateView);
 
-        topNavRow.addView(clockBox);
-        masterLayout.addView(topNavRow);
+        rightStatusCluster.addView(clockBox);
 
-        // ================= พื้นที่สลับหน้าจอ (Home / Movies / Weather) =================
+        FrameLayout.LayoutParams rightLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.END | Gravity.CENTER_VERTICAL);
+        topHeaderFrame.addView(rightStatusCluster, rightLp);
+
+        masterLayout.addView(topHeaderFrame);
+
+        // ================= พื้นที่เนื้อหาแต่ละหน้า =================
         FrameLayout pagesContainer = new FrameLayout(this);
         LinearLayout.LayoutParams pagesLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        pagesLp.setMargins(0, dp(16), 0, 0);
+        pagesLp.setMargins(0, dp(14), 0, 0);
         pagesContainer.setLayoutParams(pagesLp);
 
         pageHome = new LinearLayout(this);
@@ -231,74 +415,79 @@ public class MainActivity extends Activity {
         rootScroll.addView(masterLayout);
         setContentView(rootScroll);
 
-        switchTab(0);
+        switchTab(currentTab);
     }
 
-    // ================= สร้างหน้าที่ 1: HOME =================
+    // ================= สร้างหน้า HOME =================
     private void buildHomePage() {
-        // 1. กล่องพยากรณ์อากาศมุมซ้ายบน (พื้นหลังเบลอโปร่งแสง + วันนี้และล่วงหน้า 3 วัน)
+        // 1. กล่องพยากรณ์อากาศ 7 วันเต็มความกว้าง + อ้างอิงตำแหน่งจริง (ตามรูปที่ 1)
         LinearLayout weatherCard = new LinearLayout(this);
         weatherCard.setOrientation(LinearLayout.VERTICAL);
         weatherCard.setPadding(dp(18), dp(12), dp(18), dp(14));
         GradientDrawable glassDrawable = new GradientDrawable();
-        glassDrawable.setColor(Color.parseColor("#771E293B"));
+        glassDrawable.setColor(getCardBgColor());
         glassDrawable.setCornerRadius(dp(18));
-        glassDrawable.setStroke(dp(1), Color.parseColor("#5594A3B8"));
+        glassDrawable.setStroke(dp(1), getCardStrokeColor());
         weatherCard.setBackground(glassDrawable);
 
-        TextView locTitle = new TextView(this);
-        locTitle.setText("📍 ต.ดอนกรวย อ.ดำเนินสะดวก จ.ราชบุรี");
-        locTitle.setTextColor(Color.parseColor("#F1F5F9"));
-        locTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        locTitle.setTypeface(null, Typeface.BOLD);
-        weatherCard.addView(locTitle);
+        LinearLayout locHeaderRow = new LinearLayout(this);
+        locHeaderRow.setOrientation(LinearLayout.HORIZONTAL);
+        locHeaderRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        locationTitleView = new TextView(this);
+        locationTitleView.setText("📍 ตำแหน่งปัจจุบัน: " + currentLocationName + " (พยากรณ์ล่วงหน้า 7 วัน)");
+        locationTitleView.setTextColor(getPrimaryTextColor());
+        setScaledTextSize(locationTitleView, 13);
+        locationTitleView.setTypeface(null, Typeface.BOLD);
+        locHeaderRow.addView(locationTitleView, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
+
+        TextView refreshLocBtn = createToolButton("🔄 อัปเดตพิกัดจริง", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                Toast.makeText(MainActivity.this, "กำลังค้นหาตำแหน่งปัจจุบัน...", Toast.LENGTH_SHORT).show();
+                detectRealLocationAndFetchWeather();
+            }
+        });
+        locHeaderRow.addView(refreshLocBtn);
+        weatherCard.addView(locHeaderRow);
 
         homeWeatherRow = new LinearLayout(this);
         homeWeatherRow.setOrientation(LinearLayout.HORIZONTAL);
+        homeWeatherRow.setWeightSum(7.0f);
         homeWeatherRow.setPadding(0, dp(8), 0, 0);
         weatherCard.addView(homeWeatherRow);
 
         LinearLayout.LayoutParams wcLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        wcLp.setMargins(0, 0, 0, dp(18));
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        wcLp.setMargins(0, 0, 0, dp(16));
         pageHome.addView(weatherCard, wcLp);
 
-        // 2. ถาดแอปหลัก 4 แอป สไตล์ Apple TV พื้นหลังขาว + ไอคอนขนาดใหญ่ (ตามรูปที่ 2)
-        LinearLayout appleDockTray = new LinearLayout(this);
-        appleDockTray.setOrientation(LinearLayout.HORIZONTAL);
-        appleDockTray.setWeightSum(4.0f);
-        appleDockTray.setPadding(dp(14), dp(14), dp(14), dp(14));
+        // 2. ถาดแอปหลักทั้ง 4 (พื้นหลังขาว ไอคอนใหญ่ + กดค้างเพื่อสลับ/เปลี่ยนชื่อ/เปลี่ยนไอคอนได้)
+        mainAppsContainer = new LinearLayout(this);
+        mainAppsContainer.setOrientation(LinearLayout.HORIZONTAL);
+        mainAppsContainer.setWeightSum(4.0f);
+        mainAppsContainer.setPadding(dp(14), dp(14), dp(14), dp(14));
 
         GradientDrawable dockTrayBg = new GradientDrawable();
-        dockTrayBg.setColor(Color.parseColor("#4DFFFFFF")); // ถาดกระจกขาวโปร่งแสงแบบ Apple TV
+        dockTrayBg.setColor(Color.parseColor("#4DFFFFFF"));
         dockTrayBg.setCornerRadius(dp(26));
         dockTrayBg.setStroke(dp(1), Color.parseColor("#80FFFFFF"));
-        appleDockTray.setBackground(dockTrayBg);
+        mainAppsContainer.setBackground(dockTrayBg);
 
-        appleDockTray.addView(createWhiteAppTile(
-                "YouTube", "#FF0000", "▶",
-                new String[]{"com.google.android.youtube.tv", "com.google.android.youtube", "com.liskovsoft.smarttubetv.beta", "com.liskovsoft.smarttubetv"},
-                "youtube"
-        ));
-        appleDockTray.addView(createWhiteAppTile(
-                "Emby", "#52B54B", "🎬",
-                new String[]{"tv.emby.embyatv", "com.mb.androidtv"},
-                "emby"
-        ));
-        appleDockTray.addView(createWhiteAppTile(
-                "TrueID", "#E11D48", "TRUE",
-                new String[]{"com.tdcm.trueidapp", "com.truecorp.trueidtv", "com.tdcm.trueidtv"},
-                "trueid"
-        ));
-        appleDockTray.addView(createWhiteAppTile(
-                "TV Bro", "#2563EB", "🌐",
-                new String[]{"com.phlox.tvbro"},
-                "tv bro"
-        ));
+        renderMainFourApps();
+        pageHome.addView(mainAppsContainer);
 
-        pageHome.addView(appleDockTray);
+        // 3. แถบแสดงแอปทั้งหมดที่มีในเครื่อง (ขนาดเล็กกว่าแอปหลักพอสมควร ตามรูปที่ 3)
+        pageHome.addView(createSectionHeader("📲 แอปทั้งหมดที่มีในเครื่อง (กดค้างที่แอปเพื่อจัดเรียง / ตั้งค่า)"));
+        HorizontalScrollView allAppsScroll = new HorizontalScrollView(this);
+        allAppsScroll.setHorizontalScrollBarEnabled(false);
+        allAppsRowContainer = new LinearLayout(this);
+        allAppsRowContainer.setOrientation(LinearLayout.HORIZONTAL);
+        allAppsScroll.addView(allAppsRowContainer);
+        pageHome.addView(allAppsScroll);
+        renderAllAppsRow();
 
-        // 3. แถบที่ 1: Emby แนะนำ (กรอบสีเขียวตามรูปที่ 1)
+        // 4. แถบแนะนำหนังจาก Emby
         pageHome.addView(createSectionHeader("🎬 ภาพยนตร์และซีรีส์แนะนำจาก Emby"));
         HorizontalScrollView embyScroll = new HorizontalScrollView(this);
         embyScroll.setHorizontalScrollBarEnabled(false);
@@ -307,7 +496,7 @@ public class MainActivity extends Activity {
         embyScroll.addView(homeEmbyRow);
         pageHome.addView(embyScroll);
 
-        // 4. แถบที่ 2: ข่าวสารจาก YouTube (กรอบสีแดงตามรูปที่ 1)
+        // 5. แถบข่าวสารจาก YouTube
         pageHome.addView(createSectionHeader("📰 ข่าวสารและวิดีโอล่าสุดจาก YouTube"));
         HorizontalScrollView ytScroll = new HorizontalScrollView(this);
         ytScroll.setHorizontalScrollBarEnabled(false);
@@ -317,85 +506,104 @@ public class MainActivity extends Activity {
         pageHome.addView(ytScroll);
     }
 
-    // ================= สร้างหน้าที่ 2: MOVIES (แยกหมวดหมู่หนังจาก Emby ตามรูปที่ 4) =================
-    private void buildMoviesPage() {
-        LinearLayout headerBar = new LinearLayout(this);
-        headerBar.setOrientation(LinearLayout.HORIZONTAL);
-        headerBar.setGravity(Gravity.CENTER_VERTICAL);
-        headerBar.setPadding(dp(4), dp(4), dp(4), dp(12));
-
-        TextView title = new TextView(this);
-        title.setText("คลังภาพยนตร์และซีรีส์แยกตามหมวดหมู่ (Emby Libraries)");
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
-        title.setTypeface(null, Typeface.BOLD);
-        headerBar.addView(title);
-
-        pageMovies.addView(headerBar);
-
-        moviesCategoriesContainer = new LinearLayout(this);
-        moviesCategoriesContainer.setOrientation(LinearLayout.VERTICAL);
-        pageMovies.addView(moviesCategoriesContainer);
+    // ================= วาดแอปหลัก 4 แอป (รองรับสลับตำแหน่ง, เปลี่ยนชื่อ, เปลี่ยนไอคอน) =================
+    private List<String> getMainAppSlotsOrder() {
+        String saved = prefs.getString("main_slots_order", "youtube,emby,trueid,tvbro");
+        return new ArrayList<String>(Arrays.asList(saved.split(",")));
     }
 
-    // ================= สร้างหน้าที่ 3: WEATHER (พยากรณ์อากาศละเอียด) =================
-    private void buildWeatherPage() {
-        weatherDetailContainer = new LinearLayout(this);
-        weatherDetailContainer.setOrientation(LinearLayout.VERTICAL);
-        pageWeather.addView(weatherDetailContainer);
+    private void saveMainAppSlotsOrder(List<String> order) {
+        prefs.edit().putString("main_slots_order", TextUtils.join(",", order)).apply();
     }
 
-    // สร้างปุ่มแอปหลัก 4 แอป พื้นหลังขาวสะอาด + ไอคอนใหญ่เต็มตา (ตามรูปที่ 2)
-    private View createWhiteAppTile(final String title, String badgeColor, String badgeText, final String[] pkgCandidates, final String keyword) {
+    private void renderMainFourApps() {
+        if (mainAppsContainer == null) return;
+        mainAppsContainer.removeAllViews();
+        final List<String> slots = getMainAppSlotsOrder();
+
+        for (int i = 0; i < slots.size(); i++) {
+            final int slotIdx = i;
+            final String slotId = slots.get(i);
+            String defaultName;
+            String badgeColor;
+            String badgeText;
+            final String[] pkgCandidates;
+            final String keyword;
+
+            if ("youtube".equals(slotId)) {
+                defaultName = "YouTube";
+                badgeColor = "#FF0000";
+                badgeText = "▶";
+                pkgCandidates = new String[]{"com.google.android.youtube.tv", "com.google.android.youtube", "com.liskovsoft.smarttubetv.beta", "com.liskovsoft.smarttubetv"};
+                keyword = "youtube";
+            } else if ("emby".equals(slotId)) {
+                defaultName = "Emby";
+                badgeColor = "#52B54B";
+                badgeText = "🎬";
+                pkgCandidates = new String[]{"tv.emby.embyatv", "com.mb.androidtv"};
+                keyword = "emby";
+            } else if ("trueid".equals(slotId)) {
+                defaultName = "TrueID";
+                badgeColor = "#E11D48";
+                badgeText = "TRUE";
+                pkgCandidates = new String[]{"com.tdcm.trueidapp", "com.truecorp.trueidtv", "com.tdcm.trueidtv"};
+                keyword = "trueid";
+            } else {
+                defaultName = "TV Bro";
+                badgeColor = "#2563EB";
+                badgeText = "🌐";
+                pkgCandidates = new String[]{"com.phlox.tvbro"};
+                keyword = "tv bro";
+            }
+
+            final String resolvedPkg = resolveInstalledPackage(pkgCandidates, keyword);
+            final String customKey = !TextUtils.isEmpty(resolvedPkg) ? resolvedPkg : ("slot_" + slotId);
+            final String displayTitle = prefs.getString("custom_name_" + customKey, defaultName);
+
+            View tile = createWhiteAppTile(displayTitle, badgeColor, badgeText, pkgCandidates, keyword, customKey);
+            tile.setOnLongClickListener(new View.OnLongClickListener() {
+                @Override
+                public boolean onLongClick(View v) {
+                    showAppLongPressMenu(displayTitle, resolvedPkg, customKey, true, slotIdx);
+                    return true;
+                }
+            });
+            mainAppsContainer.addView(tile);
+        }
+    }
+
+    private View createWhiteAppTile(final String title, String defaultBadgeColor, String defaultBadgeText,
+                                    final String[] pkgCandidates, final String keyword, String customKey) {
         LinearLayout tile = new LinearLayout(this);
         tile.setOrientation(LinearLayout.VERTICAL);
         tile.setGravity(Gravity.CENTER);
-        tile.setPadding(dp(16), dp(16), dp(16), dp(14));
+        tile.setPadding(dp(14), dp(14), dp(14), dp(12));
 
         final GradientDrawable normalBg = new GradientDrawable();
-        normalBg.setColor(Color.WHITE); // พื้นหลังขาวตามรูปที่ 2
+        normalBg.setColor(Color.WHITE);
         normalBg.setCornerRadius(dp(20));
         normalBg.setStroke(dp(2), Color.parseColor("#E2E8F0"));
 
         final GradientDrawable focusBg = new GradientDrawable();
         focusBg.setColor(Color.WHITE);
         focusBg.setCornerRadius(dp(20));
-        focusBg.setStroke(dp(5), Color.parseColor("#38BDF8")); // กรอบฟ้าเรืองแสงเมื่อเลื่อนรีโมทมาชี้
+        focusBg.setStroke(dp(5), Color.parseColor("#38BDF8"));
 
         tile.setBackground(normalBg);
         tile.setFocusable(true);
         tile.setClickable(true);
+        tile.setLongClickable(true);
 
-        Drawable appIcon = findAppIcon(pkgCandidates, keyword);
-        if (appIcon != null) {
-            ImageView iconView = new ImageView(this);
-            iconView.setImageDrawable(appIcon);
-            iconView.setScaleType(ImageView.ScaleType.FIT_CENTER);
-            LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(72), dp(72));
-            tile.addView(iconView, iconLp);
-        } else {
-            // หากยังไม่ได้ลงแอปในเครื่องที่ใช้เทส ให้วาดโลโก้ขนาดใหญ่แทน
-            TextView badge = new TextView(this);
-            badge.setText(badgeText);
-            badge.setTextColor(Color.WHITE);
-            badge.setGravity(Gravity.CENTER);
-            badge.setTypeface(null, Typeface.BOLD);
-            badge.setTextSize(TypedValue.COMPLEX_UNIT_SP, badgeText.length() > 2 ? 16 : 30);
-
-            GradientDrawable badgeBg = new GradientDrawable();
-            badgeBg.setColor(Color.parseColor(badgeColor));
-            badgeBg.setCornerRadius(dp(18));
-            badge.setBackground(badgeBg);
-
-            LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(dp(72), dp(72));
-            tile.addView(badge, badgeLp);
-        }
+        View iconView = buildAppIconView(customKey, pkgCandidates, keyword, defaultBadgeColor, defaultBadgeText, dp(68));
+        tile.addView(iconView);
 
         TextView label = new TextView(this);
         label.setText(title);
-        label.setTextColor(Color.parseColor("#0F172A")); // ตัวหนังสือสีเข้มตัดกับพื้นหลังขาว
-        label.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+        label.setTextColor(Color.parseColor("#0F172A"));
+        setScaledTextSize(label, 16);
         label.setTypeface(null, Typeface.BOLD);
+        label.setSingleLine(true);
+        label.setEllipsize(TextUtils.TruncateAt.END);
         label.setPadding(0, dp(8), 0, 0);
         tile.addView(label);
 
@@ -403,7 +611,7 @@ public class MainActivity extends Activity {
             @Override
             public void onFocusChange(View v, boolean hasFocus) {
                 v.setBackground(hasFocus ? focusBg : normalBg);
-                v.animate().scaleX(hasFocus ? 1.07f : 1.0f).scaleY(hasFocus ? 1.07f : 1.0f).setDuration(150).start();
+                v.animate().scaleX(hasFocus ? 1.06f : 1.0f).scaleY(hasFocus ? 1.06f : 1.0f).setDuration(150).start();
             }
         });
 
@@ -414,79 +622,788 @@ public class MainActivity extends Activity {
             }
         });
 
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(138), 1.0f);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(134), 1.0f);
         lp.setMargins(dp(8), dp(2), dp(8), dp(2));
         tile.setLayoutParams(lp);
         return tile;
     }
 
-    // ปุ่มสลับหน้า Home | Movies | Weather ด้านบน
-    private TextView createNavTabButton(String text, final int tabIndex) {
-        final TextView tv = new TextView(this);
-        tv.setText(text);
-        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
-        tv.setTypeface(null, Typeface.BOLD);
-        tv.setPadding(dp(22), dp(8), dp(22), dp(8));
-        tv.setFocusable(true);
-        tv.setClickable(true);
-
-        tv.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                switchTab(tabIndex);
-            }
-        });
-
-        tv.setOnFocusChangeListener(new View.OnFocusChangeListener() {
-            @Override
-            public void onFocusChange(View v, boolean hasFocus) {
-                updateNavTabStyles();
-            }
-        });
-
-        return tv;
+    // ================= วาดแถบแอปทั้งหมดในเครื่อง (ขนาดเล็กกว่าแอปหลัก ตามรูปที่ 3) =================
+    private static class AppEntry {
+        String pkg;
+        String label;
     }
 
-    private void switchTab(int index) {
-        currentTab = index;
-        pageHome.setVisibility(index == 0 ? View.VISIBLE : View.GONE);
-        pageMovies.setVisibility(index == 1 ? View.VISIBLE : View.GONE);
-        pageWeather.setVisibility(index == 2 ? View.VISIBLE : View.GONE);
-        updateNavTabStyles();
+    private List<AppEntry> getOrderedInstalledApps() {
+        PackageManager pm = getPackageManager();
+        List<ApplicationInfo> installed = pm.getInstalledApplications(0);
+        List<AppEntry> list = new ArrayList<AppEntry>();
+
+        for (ApplicationInfo ai : installed) {
+            Intent launch = pm.getLeanbackLaunchIntentForPackage(ai.packageName);
+            if (launch == null) launch = pm.getLaunchIntentForPackage(ai.packageName);
+            if (launch != null && !ai.packageName.equals(getPackageName())) {
+                AppEntry entry = new AppEntry();
+                entry.pkg = ai.packageName;
+                String defaultLabel = pm.getApplicationLabel(ai).toString();
+                entry.label = prefs.getString("custom_name_" + ai.packageName, defaultLabel);
+                list.add(entry);
+            }
+        }
+
+        String savedOrder = prefs.getString("all_apps_custom_order", "");
+        final List<String> orderList = TextUtils.isEmpty(savedOrder)
+                ? new ArrayList<String>()
+                : Arrays.asList(savedOrder.split(","));
+
+        Collections.sort(list, new Comparator<AppEntry>() {
+            @Override
+            public int compare(AppEntry a, AppEntry b) {
+                int idxA = orderList.indexOf(a.pkg);
+                int idxB = orderList.indexOf(b.pkg);
+                if (idxA != -1 && idxB != -1) return idxA - idxB;
+                if (idxA != -1) return -1;
+                if (idxB != -1) return 1;
+                return a.label.compareToIgnoreCase(b.label);
+            }
+        });
+        return list;
     }
 
-    private void updateNavTabStyles() {
-        TextView[] tabs = new TextView[]{tabHomeBtn, tabMoviesBtn, tabWeatherBtn};
-        for (int i = 0; i < tabs.length; i++) {
-            TextView t = tabs[i];
-            boolean isSelected = (currentTab == i);
-            boolean isFocused = t.hasFocus();
+    private void saveInstalledAppsOrder(List<AppEntry> entries) {
+        List<String> pkgs = new ArrayList<String>();
+        for (AppEntry e : entries) pkgs.add(e.pkg);
+        prefs.edit().putString("all_apps_custom_order", TextUtils.join(",", pkgs)).apply();
+    }
 
-            GradientDrawable bg = new GradientDrawable();
-            bg.setCornerRadius(dp(20));
+    private void renderAllAppsRow() {
+        if (allAppsRowContainer == null) return;
+        allAppsRowContainer.removeAllViews();
+        final List<AppEntry> apps = getOrderedInstalledApps();
 
-            if (isFocused) {
-                bg.setColor(Color.WHITE);
-                t.setTextColor(Color.parseColor("#0F172A"));
-            } else if (isSelected) {
-                bg.setColor(Color.parseColor("#33FFFFFF"));
-                bg.setStroke(dp(1), Color.parseColor("#88FFFFFF"));
-                t.setTextColor(Color.WHITE);
-            } else {
-                bg.setColor(Color.TRANSPARENT);
-                t.setTextColor(Color.parseColor("#94A3B8"));
-            }
-            t.setBackground(bg);
+        for (int i = 0; i < apps.size(); i++) {
+            final int index = i;
+            final AppEntry app = apps.get(i);
+            allAppsRowContainer.addView(createSmallAppCard(app, index));
         }
     }
 
-    // ================= ดึงพยากรณ์อากาศ (ทั้งหน้า Home และหน้า Weather ละเอียด) =================
+    private View createSmallAppCard(final AppEntry app, final int positionIndex) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setGravity(Gravity.CENTER);
+        card.setPadding(dp(10), dp(10), dp(10), dp(8));
+
+        final GradientDrawable normalBg = new GradientDrawable();
+        normalBg.setColor(getCardBgColor());
+        normalBg.setCornerRadius(dp(16));
+        normalBg.setStroke(dp(1), getCardStrokeColor());
+
+        final GradientDrawable focusBg = new GradientDrawable();
+        focusBg.setColor(Color.parseColor("#2563EB"));
+        focusBg.setCornerRadius(dp(16));
+        focusBg.setStroke(dp(2), Color.WHITE);
+
+        card.setBackground(normalBg);
+        card.setFocusable(true);
+        card.setClickable(true);
+        card.setLongClickable(true);
+
+        View iconView = buildAppIconView(app.pkg, new String[]{app.pkg}, "", "#334155", "📱", dp(42));
+        card.addView(iconView);
+
+        final TextView tv = new TextView(this);
+        tv.setText(app.label);
+        tv.setTextColor(getPrimaryTextColor());
+        setScaledTextSize(tv, 11);
+        tv.setTypeface(null, Typeface.BOLD);
+        tv.setSingleLine(true);
+        tv.setEllipsize(TextUtils.TruncateAt.END);
+        tv.setGravity(Gravity.CENTER);
+        tv.setPadding(0, dp(6), 0, 0);
+        card.addView(tv);
+
+        card.setOnFocusChangeListener(new View.OnFocusChangeListener() {
+            @Override
+            public void onFocusChange(View v, boolean hasFocus) {
+                v.setBackground(hasFocus ? focusBg : normalBg);
+                tv.setTextColor(hasFocus ? Color.WHITE : getPrimaryTextColor());
+                v.animate().scaleX(hasFocus ? 1.08f : 1.0f).scaleY(hasFocus ? 1.08f : 1.0f).setDuration(140).start();
+            }
+        });
+
+        card.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                launchApp(new String[]{app.pkg}, "", app.label);
+            }
+        });
+
+        card.setOnLongClickListener(new View.OnLongClickListener() {
+            @Override
+            public boolean onLongClick(View v) {
+                showAppLongPressMenu(app.label, app.pkg, app.pkg, false, positionIndex);
+                return true;
+            }
+        });
+
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(98), dp(88));
+        lp.setMargins(dp(5), dp(4), dp(5), dp(4));
+        card.setLayoutParams(lp);
+        return card;
+    }
+
+    private View buildAppIconView(String customKey, String[] pkgCandidates, String keyword,
+                                  String fallbackColor, String fallbackText, int sizePx) {
+        // 1. ตรวจสอบว่าผู้ใช้ตั้งไอคอนรูปภาพเองหรือไม่
+        File customIconFile = new File(getFilesDir(), "icon_" + customKey.replaceAll("[^a-zA-Z0-9]", "_") + ".png");
+        String iconPreset = prefs.getString("custom_icon_preset_" + customKey, "");
+
+        if ("FILE".equals(iconPreset) && customIconFile.exists()) {
+            Bitmap bmp = BitmapFactory.decodeFile(customIconFile.getAbsolutePath());
+            if (bmp != null) {
+                ImageView iv = new ImageView(this);
+                iv.setImageBitmap(bmp);
+                iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                iv.setLayoutParams(new LinearLayout.LayoutParams(sizePx, sizePx));
+                return iv;
+            }
+        } else if (!TextUtils.isEmpty(iconPreset) && iconPreset.contains("|")) {
+            String[] parts = iconPreset.split("\\|");
+            TextView badge = new TextView(this);
+            badge.setText(parts[0]);
+            badge.setTextColor(Color.WHITE);
+            badge.setGravity(Gravity.CENTER);
+            badge.setTypeface(null, Typeface.BOLD);
+            badge.setTextSize(TypedValue.COMPLEX_UNIT_PX, sizePx * 0.45f);
+
+            GradientDrawable bg = new GradientDrawable();
+            bg.setColor(Color.parseColor(parts[1]));
+            bg.setCornerRadius(sizePx * 0.25f);
+            badge.setBackground(bg);
+            badge.setLayoutParams(new LinearLayout.LayoutParams(sizePx, sizePx));
+            return badge;
+        }
+
+        // 2. ดึงไอคอนจริงจากระบบ
+        Drawable sysIcon = findAppIcon(pkgCandidates, keyword);
+        if (sysIcon != null) {
+            ImageView iv = new ImageView(this);
+            iv.setImageDrawable(sysIcon);
+            iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+            iv.setLayoutParams(new LinearLayout.LayoutParams(sizePx, sizePx));
+            return iv;
+        }
+
+        // 3. ไอคอนสำรองกรณีไม่พบแอปในเครื่องเทส
+        TextView badge = new TextView(this);
+        badge.setText(fallbackText);
+        badge.setTextColor(Color.WHITE);
+        badge.setGravity(Gravity.CENTER);
+        badge.setTypeface(null, Typeface.BOLD);
+        badge.setTextSize(TypedValue.COMPLEX_UNIT_PX, fallbackText.length() > 2 ? sizePx * 0.24f : sizePx * 0.42f);
+
+        GradientDrawable badgeBg = new GradientDrawable();
+        badgeBg.setColor(Color.parseColor(fallbackColor));
+        badgeBg.setCornerRadius(sizePx * 0.25f);
+        badge.setBackground(badgeBg);
+        badge.setLayoutParams(new LinearLayout.LayoutParams(sizePx, sizePx));
+        return badge;
+    }
+
+    // ================= ข้อ 5: เมนูลอยเมื่อกดค้างที่ตัวแอป =================
+    private void showAppLongPressMenu(final String appTitle, final String packageName, final String customKey,
+                                      final boolean isMainFourSlot, final int currentIndex) {
+        final String[] options = new String[]{
+            "🔀  สลับตำแหน่งของแอป",
+            "ℹ️  ข้อมูลแอป (App Info)",
+            "🔄  รีสตาร์ทตัวแอป",
+            "✏️  เปลี่ยนชื่อแอป",
+            "🖼️  เปลี่ยนไอคอนแอป",
+            "🗑️  ถอนการติดตั้ง (Uninstall)"
+        };
+
+        new AlertDialog.Builder(this)
+                .setTitle("จัดการแอป: " + appTitle)
+                .setItems(options, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        switch (which) {
+                            case 0:
+                                showSwapPositionDialog(appTitle, isMainFourSlot, currentIndex);
+                                break;
+                            case 1:
+                                openAppInfoScreen(packageName, appTitle);
+                                break;
+                            case 2:
+                                restartTargetApp(packageName, appTitle);
+                                break;
+                            case 3:
+                                showRenameAppDialog(appTitle, customKey);
+                                break;
+                            case 4:
+                                showChangeIconDialog(appTitle, customKey);
+                                break;
+                            case 5:
+                                uninstallTargetApp(packageName, appTitle);
+                                break;
+                        }
+                    }
+                })
+                .setNegativeButton("ปิด", null)
+                .show();
+    }
+
+    private void showSwapPositionDialog(String currentTitle, final boolean isMainFour, final int fromIndex) {
+        if (isMainFour) {
+            final List<String> slots = getMainAppSlotsOrder();
+            String[] slotNames = new String[slots.size()];
+            for (int i = 0; i < slots.size(); i++) {
+                slotNames[i] = "ตำแหน่งที่ " + (i + 1) + " (" + slots.get(i).toUpperCase(Locale.ROOT) + ")";
+            }
+            new AlertDialog.Builder(this)
+                    .setTitle("เลือกตำแหน่งที่ต้องการสลับกับ " + currentTitle)
+                    .setItems(slotNames, new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface d, int toIndex) {
+                            Collections.swap(slots, fromIndex, toIndex);
+                            saveMainAppSlotsOrder(slots);
+                            renderMainFourApps();
+                            Toast.makeText(MainActivity.this, "สลับตำแหน่งแอปหลักเรียบร้อย", Toast.LENGTH_SHORT).show();
+                        }
+                    })
+                    .show();
+        } else {
+            final List<AppEntry> apps = getOrderedInstalledApps();
+            String[] labels = new String[apps.size()];
+            for (int i = 0; i < apps.size(); i++) {
+                labels[i] = (i + 1) + ". " + apps.get(i).label;
+            }
+            new AlertDialog.Builder(this)
+                    .setTitle("สลับตำแหน่ง '" + currentTitle + "' กับแอปใด?")
+                    .setItems(labels, new DialogInterface.OnClickListener() {
+                        @Override
+                        public void onClick(DialogInterface d, int toIndex) {
+                            if (fromIndex >= 0 && fromIndex < apps.size() && toIndex >= 0 && toIndex < apps.size()) {
+                                Collections.swap(apps, fromIndex, toIndex);
+                                saveInstalledAppsOrder(apps);
+                                renderAllAppsRow();
+                                Toast.makeText(MainActivity.this, "สลับตำแหน่งเรียบร้อย", Toast.LENGTH_SHORT).show();
+                            }
+                        }
+                    })
+                    .show();
+        }
+    }
+
+    private void openAppInfoScreen(String pkg, String title) {
+        if (TextUtils.isEmpty(pkg)) {
+            Toast.makeText(this, "ไม่พบแอป " + title + " ติดตั้งในเครื่อง", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+            intent.setData(Uri.parse("package:" + pkg));
+            startActivity(intent);
+        } catch (Exception e) {
+            Toast.makeText(this, "ไม่สามารถเปิดหน้าข้อมูลแอปได้", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void restartTargetApp(String pkg, String title) {
+        if (TextUtils.isEmpty(pkg)) {
+            Toast.makeText(this, "ไม่พบแอป " + title + " ติดตั้งในเครื่อง", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+            if (am != null) {
+                am.killBackgroundProcesses(pkg);
+            }
+            PackageManager pm = getPackageManager();
+            Intent intent = pm.getLeanbackLaunchIntentForPackage(pkg);
+            if (intent == null) intent = pm.getLaunchIntentForPackage(pkg);
+            if (intent != null) {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                startActivity(intent);
+                Toast.makeText(this, "กำลังรีสตาร์ทแอป " + title + "...", Toast.LENGTH_SHORT).show();
+            }
+        } catch (Exception e) {
+            Toast.makeText(this, "ไม่สามารถรีสตาร์ทแอปได้", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void showRenameAppDialog(String currentTitle, final String customKey) {
+        final EditText input = new EditText(this);
+        input.setText(currentTitle);
+        input.setHint("ใส่ชื่อแอปใหม่");
+
+        new AlertDialog.Builder(this)
+                .setTitle("เปลี่ยนชื่อแอป")
+                .setView(input)
+                .setPositiveButton("บันทึก", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int w) {
+                        String newName = input.getText().toString().trim();
+                        if (!TextUtils.isEmpty(newName)) {
+                            prefs.edit().putString("custom_name_" + customKey, newName).apply();
+                        } else {
+                            prefs.edit().remove("custom_name_" + customKey).apply();
+                        }
+                        renderMainFourApps();
+                        renderAllAppsRow();
+                    }
+                })
+                .setNeutralButton("คืนค่าชื่อเดิม", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int w) {
+                        prefs.edit().remove("custom_name_" + customKey).apply();
+                        renderMainFourApps();
+                        renderAllAppsRow();
+                    }
+                })
+                .setNegativeButton("ยกเลิก", null)
+                .show();
+    }
+
+    private void showChangeIconDialog(String appTitle, final String customKey) {
+        final String[] iconOptions = new String[]{
+            "🖼️  เลือกรูปภาพจากในเครื่องมาเป็นไอคอน",
+            "🔴  ไอคอนปุ่มแดง Play (▶)",
+            "🟢  ไอคอนปุ่มเขียว Cinema (🎬)",
+            "🔵  ไอคอนปุ่มฟ้า TV Live (📺)",
+            "🟣  ไอคอนปุ่มม่วง Gamepad (🎮)",
+            "🟠  ไอคอนปุ่มส้ม Music (🎵)",
+            "🔄  คืนค่าไอคอนดั้งเดิมของแอป"
+        };
+        final String[] presetValues = new String[]{
+            "PICK",
+            "▶|#DC2626",
+            "🎬|#16A34A",
+            "📺|#2563EB",
+            "🎮|#7C3AED",
+            "🎵|#EA580C",
+            ""
+        };
+
+        new AlertDialog.Builder(this)
+                .setTitle("เปลี่ยนไอคอน: " + appTitle)
+                .setItems(iconOptions, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        if (which == 0) {
+                            pendingIconTargetKey = customKey;
+                            try {
+                                Intent pick = new Intent(Intent.ACTION_GET_CONTENT);
+                                pick.setType("image/*");
+                                startActivityForResult(Intent.createChooser(pick, "เลือกรูปไอคอน"), REQ_PICK_APP_ICON);
+                            } catch (Exception e) {
+                                Toast.makeText(MainActivity.this, "เครื่องนี้ไม่มีแอปจัดการไฟล์รูปภาพ", Toast.LENGTH_SHORT).show();
+                            }
+                        } else if (which == 6) {
+                            prefs.edit().remove("custom_icon_preset_" + customKey).apply();
+                            renderMainFourApps();
+                            renderAllAppsRow();
+                        } else {
+                            prefs.edit().putString("custom_icon_preset_" + customKey, presetValues[which]).apply();
+                            renderMainFourApps();
+                            renderAllAppsRow();
+                        }
+                    }
+                })
+                .show();
+    }
+
+    private void uninstallTargetApp(String pkg, String title) {
+        if (TextUtils.isEmpty(pkg)) {
+            Toast.makeText(this, "ยังไม่ได้ติดตั้งแอป " + title + " ในเครื่อง", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            Intent intent = new Intent(Intent.ACTION_DELETE);
+            intent.setData(Uri.parse("package:" + pkg));
+            startActivity(intent);
+        } catch (Exception e) {
+            Toast.makeText(this, "ไม่สามารถถอนการติดตั้งแอปนี้ได้", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // ================= ข้อ 3: เมนูการตั้งค่าลักษณะหน้าจอ (กรอบสีฟ้า รูปที่ 2) =================
+    private void showAppearanceSettingsDialog() {
+        final AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        int curVol = am != null ? am.getStreamVolume(AudioManager.STREAM_MUSIC) : 0;
+        int maxVol = am != null ? am.getStreamMaxVolume(AudioManager.STREAM_MUSIC) : 15;
+        String themeLabel = isLightTheme() ? "☀️ ธีมสว่าง (Light Mode)" : "🌙 ธีมมืด (Dark Mode)";
+
+        String[] items = new String[]{
+            "🔤  ปรับขนาดอักษร (ปัจจุบัน: " + Math.round(getFontScale() * 100) + "%)",
+            "🎨  เปลี่ยนสีตัวอักษรหลัก",
+            "🌗  สลับโหมดธีม (ปัจจุบัน: " + themeLabel + ")",
+            "🖼️  เปลี่ยนวอลเปเปอร์พื้นหลัง",
+            "🔊  เพิ่ม / ลดเสียงระบบ (ระดับปัจจุบัน: " + curVol + " / " + maxVol + ")"
+        };
+
+        new AlertDialog.Builder(this)
+                .setTitle("🎨 การตั้งค่าลักษณะหน้าจอและระบบเสียง")
+                .setItems(items, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        switch (which) {
+                            case 0:
+                                showFontScaleDialog();
+                                break;
+                            case 1:
+                                showTextColorDialog();
+                                break;
+                            case 2:
+                                prefs.edit().putBoolean("ui_light_theme", !isLightTheme()).apply();
+                                rebuildEntireScreen();
+                                break;
+                            case 3:
+                                showWallpaperPickerDialog();
+                                break;
+                            case 4:
+                                showVolumeControlDialog();
+                                break;
+                        }
+                    }
+                })
+                .setNegativeButton("ปิด", null)
+                .show();
+    }
+
+    private void showFontScaleDialog() {
+        final String[] labels = new String[]{"เล็ก (85%)", "ปกติ (100%)", "ใหญ่ (115%)", "ใหญ่มาก (130%)"};
+        final float[] scales = new float[]{0.85f, 1.0f, 1.15f, 1.30f};
+        new AlertDialog.Builder(this)
+                .setTitle("เลือกขนาดตัวอักษร")
+                .setItems(labels, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        prefs.edit().putFloat("ui_font_scale", scales[which]).apply();
+                        rebuildEntireScreen();
+                    }
+                })
+                .show();
+    }
+
+    private void showTextColorDialog() {
+        final String[] names = new String[]{
+            "⚪  สีขาว / สีอัตโนมัติตามธีม (ค่าเริ่มต้น)",
+            "🩵  สีฟ้าคราม (Sky Cyan)",
+            "🟡  สีทองอร่าม (Warm Gold)",
+            "🟢  สีเขียวมรกต (Emerald Mint)",
+            "🌸  สีชมพูซากุระ (Soft Rose)"
+        };
+        final String[] hexes = new String[]{"", "#38BDF8", "#FACC15", "#4ADE80", "#F472B6"};
+        new AlertDialog.Builder(this)
+                .setTitle("เลือกสีตัวอักษรหลัก")
+                .setItems(names, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        prefs.edit().putString("ui_text_color", hexes[which]).apply();
+                        rebuildEntireScreen();
+                    }
+                })
+                .show();
+    }
+
+    private void showWallpaperPickerDialog() {
+        final String[] walls = new String[]{
+            "🌌  Midnight Blue (น้ำเงินเข้มมาตรฐาน)",
+            "🌲  Emerald Forest (เขียวมรกตเข้ม)",
+            "🔮  Royal Purple (ม่วงอวกาศ)",
+            "🔥  Sunset Crimson (แดงเข้ม)",
+            "⚫  Pure OLED Black (ดำสนิทประหยัดพลังงาน)",
+            "🖼️  เลือกรูปภาพวอลเปเปอร์จากในเครื่อง..."
+        };
+        new AlertDialog.Builder(this)
+                .setTitle("เลือกวอลเปเปอร์พื้นหลัง")
+                .setItems(walls, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        if (which == 5) {
+                            try {
+                                Intent pick = new Intent(Intent.ACTION_GET_CONTENT);
+                                pick.setType("image/*");
+                                startActivityForResult(Intent.createChooser(pick, "เลือกรูปวอลเปเปอร์"), REQ_PICK_WALLPAPER);
+                            } catch (Exception e) {
+                                Toast.makeText(MainActivity.this, "ไม่พบแอปเลือกรูปภาพในเครื่อง", Toast.LENGTH_SHORT).show();
+                            }
+                        } else {
+                            prefs.edit().putInt("ui_wallpaper_preset", which).apply();
+                            applyWallpaperToRoot();
+                        }
+                    }
+                })
+                .show();
+    }
+
+    private void showVolumeControlDialog() {
+        final AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        if (am == null) return;
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER);
+        box.setPadding(dp(24), dp(20), dp(24), dp(20));
+
+        final TextView volLabel = new TextView(this);
+        volLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        volLabel.setTypeface(null, Typeface.BOLD);
+        volLabel.setGravity(Gravity.CENTER);
+        box.addView(volLabel);
+
+        final Runnable updateText = new Runnable() {
+            @Override
+            public void run() {
+                int c = am.getStreamVolume(AudioManager.STREAM_MUSIC);
+                int m = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+                volLabel.setText("🔊 ระดับเสียงปัจจุบัน: " + c + " / " + m);
+            }
+        };
+        updateText.run();
+
+        LinearLayout btnRow = new LinearLayout(this);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        btnRow.setGravity(Gravity.CENTER);
+        btnRow.setPadding(0, dp(16), 0, 0);
+
+        btnRow.addView(createToolButton("🔉 ลดเสียง (-)", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI);
+                updateText.run();
+            }
+        }));
+        btnRow.addView(createToolButton("🔊 เพิ่มเสียง (+)", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI);
+                updateText.run();
+            }
+        }));
+        btnRow.addView(createToolButton("🔇 ปิด/เปิดเสียง", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_TOGGLE_MUTE, AudioManager.FLAG_SHOW_UI);
+                updateText.run();
+            }
+        }));
+        box.addView(btnRow);
+
+        new AlertDialog.Builder(this)
+                .setTitle("ควบคุมระดับเสียงทีวี")
+                .setView(box)
+                .setPositiveButton("เสร็จสิ้น", null)
+                .show();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        Uri uri = data.getData();
+
+        if (requestCode == REQ_PICK_WALLPAPER) {
+            try {
+                InputStream is = getContentResolver().openInputStream(uri);
+                Bitmap bmp = BitmapFactory.decodeStream(is);
+                if (is != null) is.close();
+                if (bmp != null) {
+                    File out = new File(getFilesDir(), "custom_wallpaper.jpg");
+                    FileOutputStream fos = new FileOutputStream(out);
+                    bmp.compress(Bitmap.CompressFormat.JPEG, 90, fos);
+                    fos.close();
+                    prefs.edit().putInt("ui_wallpaper_preset", 99).apply();
+                    applyWallpaperToRoot();
+                    Toast.makeText(this, "เปลี่ยนวอลเปเปอร์เรียบร้อย", Toast.LENGTH_SHORT).show();
+                }
+            } catch (Exception e) {
+                Toast.makeText(this, "ไม่สามารถโหลดรูปภาพนี้ได้", Toast.LENGTH_SHORT).show();
+            }
+        } else if (requestCode == REQ_PICK_APP_ICON && !TextUtils.isEmpty(pendingIconTargetKey)) {
+            try {
+                InputStream is = getContentResolver().openInputStream(uri);
+                Bitmap bmp = BitmapFactory.decodeStream(is);
+                if (is != null) is.close();
+                if (bmp != null) {
+                    File out = new File(getFilesDir(), "icon_" + pendingIconTargetKey.replaceAll("[^a-zA-Z0-9]", "_") + ".png");
+                    FileOutputStream fos = new FileOutputStream(out);
+                    bmp.compress(Bitmap.CompressFormat.PNG, 100, fos);
+                    fos.close();
+                    prefs.edit().putString("custom_icon_preset_" + pendingIconTargetKey, "FILE").apply();
+                    renderMainFourApps();
+                    renderAllAppsRow();
+                    Toast.makeText(this, "เปลี่ยนไอคอนแอปเรียบร้อย", Toast.LENGTH_SHORT).show();
+                }
+            } catch (Exception e) {
+                Toast.makeText(this, "ไม่สามารถตั้งรูปไอคอนได้", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    // ================= ข้อ 2: วาดไอคอนสถานะ Wi-Fi แบบเรียลไทม์ =================
+    private static class WifiSignalView extends View {
+        private int level = 4; // 0 = disconnected, 1..4 = bars
+        private boolean connected = true;
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF arcRect = new RectF();
+
+        public WifiSignalView(Context context) {
+            super(context);
+        }
+
+        public void setSignalState(boolean isConnected, int signalBars) {
+            this.connected = isConnected;
+            this.level = signalBars;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float w = getWidth();
+            float h = getHeight();
+            float cx = w / 2f;
+            float cy = h * 0.86f;
+
+            int activeColor = connected ? Color.parseColor("#38BDF8") : Color.parseColor("#EF4444");
+            int dimColor = Color.parseColor("#475569");
+
+            // จุดกลมด้านล่างสุด
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(connected && level >= 1 ? activeColor : dimColor);
+            canvas.drawCircle(cx, cy, w * 0.08f, paint);
+
+            // เส้นโค้งคลื่น Wi-Fi 3 ชั้น
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(w * 0.09f);
+            paint.setStrokeCap(Paint.Cap.ROUND);
+
+            float[] radii = new float[]{w * 0.24f, w * 0.42f, w * 0.60f};
+            for (int i = 0; i < radii.length; i++) {
+                float r = radii[i];
+                paint.setColor(connected && level >= (i + 2) ? activeColor : dimColor);
+                arcRect.set(cx - r, cy - r, cx + r, cy + r);
+                canvas.drawArc(arcRect, 225f, 90f, false, paint);
+            }
+        }
+    }
+
+    private void updateWifiIndicator() {
+        if (wifiIconView == null || wifiStatusText == null) return;
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            NetworkInfo active = cm != null ? cm.getActiveNetworkInfo() : null;
+            if (active != null && active.isConnected()) {
+                if (active.getType() == ConnectivityManager.TYPE_WIFI) {
+                    WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                    WifiInfo info = wm != null ? wm.getConnectionInfo() : null;
+                    int rssi = info != null ? info.getRssi() : -55;
+                    int bars = WifiManager.calculateSignalLevel(rssi, 4) + 1;
+                    wifiIconView.setSignalState(true, bars);
+                    wifiStatusText.setText("Wi-Fi ปกติ");
+                } else if (active.getType() == ConnectivityManager.TYPE_ETHERNET) {
+                    wifiIconView.setSignalState(true, 4);
+                    wifiStatusText.setText("LAN เชื่อมต่อ");
+                } else {
+                    wifiIconView.setSignalState(true, 3);
+                    wifiStatusText.setText("ออนไลน์");
+                }
+            } else {
+                wifiIconView.setSignalState(false, 0);
+                wifiStatusText.setText("ออฟไลน์");
+            }
+        } catch (Exception e) {
+            wifiIconView.setSignalState(true, 4);
+            wifiStatusText.setText("Wi-Fi");
+        }
+    }
+
+    // ================= ข้อ 1: ระบบตรวจหาตำแหน่งจริงอัตโนมัติ + พยากรณ์อากาศ 7 วัน =================
+    private void detectRealLocationAndFetchWeather() {
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                boolean updated = false;
+                // 1. ลองดึงจาก LocationManager ของระบบ Android หากมีสิทธิ์
+                try {
+                    LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+                    if (lm != null) {
+                        Location loc = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
+                        if (loc == null) loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER);
+                        if (loc != null) {
+                            currentLat = loc.getLatitude();
+                            currentLon = loc.getLongitude();
+                            updated = true;
+                        }
+                    }
+                } catch (SecurityException ignored) {}
+
+                // 2. ดึงตำแหน่งจริงจาก IP Geolocation และแปลงพิกัดเป็นชื่อตำบล/อำเภอ/จังหวัดภาษาไทย
+                try {
+                    if (!updated) {
+                        String ipJsonStr = httpGet("https://ipwho.is/");
+                        JSONObject ipObj = new JSONObject(ipJsonStr);
+                        if (ipObj.optBoolean("success", false)) {
+                            currentLat = ipObj.optDouble("latitude", currentLat);
+                            currentLon = ipObj.optDouble("longitude", currentLon);
+                        }
+                    }
+
+                    // แปลงพิกัด (Reverse Geocoding) เป็นชื่อพื้นที่ภาษาไทย
+                    String geoUrl = "https://nominatim.openstreetmap.org/reverse?format=json&lat="
+                            + currentLat + "&lon=" + currentLon + "&zoom=14&accept-language=th";
+                    String geoResp = httpGet(geoUrl);
+                    JSONObject geoObj = new JSONObject(geoResp);
+                    JSONObject addr = geoObj.optJSONObject("address");
+                    if (addr != null) {
+                        String suburb = addr.optString("suburb", addr.optString("village", addr.optString("tambon", "")));
+                        String city = addr.optString("city", addr.optString("town", addr.optString("county", addr.optString("amphoe", ""))));
+                        String state = addr.optString("state", addr.optString("province", ""));
+                        StringBuilder sb = new StringBuilder();
+                        if (!TextUtils.isEmpty(suburb)) sb.append(suburb).append(" ");
+                        if (!TextUtils.isEmpty(city)) sb.append(city).append(" ");
+                        if (!TextUtils.isEmpty(state)) sb.append(state);
+                        String resolvedName = sb.toString().trim();
+                        if (!TextUtils.isEmpty(resolvedName)) {
+                            currentLocationName = resolvedName;
+                        }
+                    }
+
+                    prefs.edit()
+                            .putLong("lat_bits", Double.doubleToLongBits(currentLat))
+                            .putLong("lon_bits", Double.doubleToLongBits(currentLon))
+                            .putString("loc_name", currentLocationName)
+                            .apply();
+                } catch (Exception ignored) {}
+
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (locationTitleView != null) {
+                            locationTitleView.setText("📍 ตำแหน่งปัจจุบัน: " + currentLocationName + " (พยากรณ์ล่วงหน้า 7 วัน)");
+                        }
+                        fetchWeatherData();
+                    }
+                });
+            }
+        });
+    }
+
     private void fetchWeatherData() {
         executor.execute(new Runnable() {
             @Override
             public void run() {
                 try {
-                    String jsonStr = httpGet(WEATHER_FULL_URL);
+                    String weatherUrl = "https://api.open-meteo.com/v1/forecast?latitude=" + currentLat + "&longitude=" + currentLon +
+                            "&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m,surface_pressure" +
+                            "&hourly=temperature_2m,precipitation_probability,weather_code" +
+                            "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,uv_index_max,wind_speed_10m_max" +
+                            "&timezone=Asia%2FBangkok&forecast_days=7";
+
+                    String jsonStr = httpGet(weatherUrl);
                     final JSONObject root = new JSONObject(jsonStr);
                     final JSONObject current = root.optJSONObject("current");
                     final JSONObject hourly = root.optJSONObject("hourly");
@@ -496,7 +1413,7 @@ public class MainActivity extends Activity {
                         @Override
                         public void run() {
                             if (daily != null) {
-                                renderHomeWeatherWidget(daily);
+                                renderHomeWeather7Days(daily);
                             }
                             if (current != null && hourly != null && daily != null) {
                                 renderDetailedWeatherPage(current, hourly, daily);
@@ -507,12 +1424,14 @@ public class MainActivity extends Activity {
                     mainHandler.post(new Runnable() {
                         @Override
                         public void run() {
-                            homeWeatherRow.removeAllViews();
-                            TextView err = new TextView(MainActivity.this);
-                            err.setText("กำลังเชื่อมต่อข้อมูลสภาพอากาศ...");
-                            err.setTextColor(Color.parseColor("#94A3B8"));
-                            err.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-                            homeWeatherRow.addView(err);
+                            if (homeWeatherRow != null) {
+                                homeWeatherRow.removeAllViews();
+                                TextView err = new TextView(MainActivity.this);
+                                err.setText("กำลังเชื่อมต่อข้อมูลพยากรณ์อากาศ 7 วัน...");
+                                err.setTextColor(getSecondaryTextColor());
+                                setScaledTextSize(err, 12);
+                                homeWeatherRow.addView(err);
+                            }
                         }
                     });
                 }
@@ -520,7 +1439,9 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void renderHomeWeatherWidget(JSONObject daily) {
+    // แสดงพยากรณ์อากาศ 7 วันเรียงกันเต็มกรอบสีเขียวในหน้า Home (ตามรูปที่ 1)
+    private void renderHomeWeather7Days(JSONObject daily) {
+        if (homeWeatherRow == null) return;
         homeWeatherRow.removeAllViews();
         JSONArray times = daily.optJSONArray("time");
         JSONArray codes = daily.optJSONArray("weather_code");
@@ -530,66 +1451,87 @@ public class MainActivity extends Activity {
         JSONArray rainProbs = daily.optJSONArray("precipitation_probability_max");
 
         if (times == null) return;
-        for (int i = 0; i < Math.min(4, times.length()); i++) {
+        int count = Math.min(7, times.length());
+        for (int i = 0; i < count; i++) {
             String dateStr = times.optString(i, "");
             int code = codes != null ? codes.optInt(i, 0) : 0;
             int maxT = maxTemps != null ? (int) Math.round(maxTemps.optDouble(i, 0)) : 0;
             int minT = minTemps != null ? (int) Math.round(minTemps.optDouble(i, 0)) : 0;
             int rain = rainProbs != null ? rainProbs.optInt(i, 0) : 0;
 
-            homeWeatherRow.addView(createCompactDayWeatherBox(
-                    i == 0 ? "วันนี้" : formatThaiDayShort(dateStr), code, maxT, minT, rain));
+            View dayCard = createDayWeatherBox(
+                    i == 0 ? "วันนี้" : formatThaiDayShort(dateStr), code, maxT, minT, rain, true);
+            homeWeatherRow.addView(dayCard);
         }
     }
 
-    private View createCompactDayWeatherBox(String dayName, int code, int maxT, int minT, int rainProb) {
+    private View createDayWeatherBox(String dayName, int code, int maxT, int minT, int rainProb, boolean useEqualWeight) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setGravity(Gravity.CENTER_HORIZONTAL);
-        box.setPadding(dp(12), dp(6), dp(12), dp(6));
+        box.setPadding(dp(8), dp(8), dp(8), dp(8));
 
         GradientDrawable dayBg = new GradientDrawable();
-        dayBg.setColor(Color.parseColor("#550F172A"));
-        dayBg.setCornerRadius(dp(12));
+        dayBg.setColor(isLightTheme() ? Color.parseColor("#DDE2E8F0") : Color.parseColor("#550F172A"));
+        dayBg.setCornerRadius(dp(14));
         box.setBackground(dayBg);
 
         TextView dayTv = new TextView(this);
         dayTv.setText(dayName);
-        dayTv.setTextColor(Color.WHITE);
-        dayTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        dayTv.setTextColor(getPrimaryTextColor());
+        setScaledTextSize(dayTv, 12);
         dayTv.setTypeface(null, Typeface.BOLD);
         box.addView(dayTv);
 
         TextView iconTv = new TextView(this);
         iconTv.setText(weatherCodeToEmoji(code));
-        iconTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
+        setScaledTextSize(iconTv, 20);
         iconTv.setPadding(0, dp(2), 0, dp(2));
         box.addView(iconTv);
 
         TextView tempTv = new TextView(this);
         tempTv.setText(maxT + "°/" + minT + "°C");
-        tempTv.setTextColor(Color.parseColor("#F8FAFC"));
-        tempTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        tempTv.setTextColor(getPrimaryTextColor());
+        setScaledTextSize(tempTv, 11);
         box.addView(tempTv);
 
         TextView rainTv = new TextView(this);
         rainTv.setText("💧 " + rainProb + "%");
-        rainTv.setTextColor(Color.parseColor("#38BDF8"));
-        rainTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        rainTv.setTextColor(Color.parseColor("#0284C7"));
+        if (!isLightTheme()) rainTv.setTextColor(Color.parseColor("#38BDF8"));
+        setScaledTextSize(rainTv, 12);
         rainTv.setTypeface(null, Typeface.BOLD);
         box.addView(rainTv);
 
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(92), ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.setMargins(0, 0, dp(8), 0);
+        LinearLayout.LayoutParams lp;
+        if (useEqualWeight) {
+            lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
+            lp.setMargins(dp(4), 0, dp(4), 0);
+        } else {
+            lp = new LinearLayout.LayoutParams(dp(96), ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.setMargins(0, 0, dp(8), 0);
+        }
         box.setLayoutParams(lp);
         return box;
     }
 
-    // วาดหน้า Weather แบบละเอียดเต็มจอ
+    // ================= หน้า MOVIES และหน้า WEATHER ละเอียด =================
+    private void buildMoviesPage() {
+        moviesCategoriesContainer = new LinearLayout(this);
+        moviesCategoriesContainer.setOrientation(LinearLayout.VERTICAL);
+        pageMovies.addView(moviesCategoriesContainer);
+    }
+
+    private void buildWeatherPage() {
+        weatherDetailContainer = new LinearLayout(this);
+        weatherDetailContainer.setOrientation(LinearLayout.VERTICAL);
+        pageWeather.addView(weatherDetailContainer);
+    }
+
     private void renderDetailedWeatherPage(JSONObject current, JSONObject hourly, JSONObject daily) {
+        if (weatherDetailContainer == null) return;
         weatherDetailContainer.removeAllViews();
 
-        // 1. การ์ดสภาพอากาศปัจจุบันขนาดใหญ่
         LinearLayout heroCard = new LinearLayout(this);
         heroCard.setOrientation(LinearLayout.HORIZONTAL);
         heroCard.setGravity(Gravity.CENTER_VERTICAL);
@@ -614,16 +1556,16 @@ public class MainActivity extends Activity {
         leftHero.setOrientation(LinearLayout.VERTICAL);
 
         TextView locHeader = new TextView(this);
-        locHeader.setText("📍 ตำบลดอนกรวย อำเภอดำเนินสะดวก จังหวัดราชบุรี");
+        locHeader.setText("📍 พิกัดอ้างอิงจริง: " + currentLocationName);
         locHeader.setTextColor(Color.parseColor("#BAE6FD"));
-        locHeader.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        setScaledTextSize(locHeader, 16);
         locHeader.setTypeface(null, Typeface.BOLD);
         leftHero.addView(locHeader);
 
         TextView bigTemp = new TextView(this);
         bigTemp.setText(weatherCodeToEmoji(curCode) + " " + Math.round(curTemp) + "°C");
         bigTemp.setTextColor(Color.WHITE);
-        bigTemp.setTextSize(TypedValue.COMPLEX_UNIT_SP, 44);
+        setScaledTextSize(bigTemp, 42);
         bigTemp.setTypeface(null, Typeface.BOLD);
         bigTemp.setPadding(0, dp(4), 0, dp(4));
         leftHero.addView(bigTemp);
@@ -631,22 +1573,20 @@ public class MainActivity extends Activity {
         TextView condText = new TextView(this);
         condText.setText(weatherCodeToThaiText(curCode) + "  •  รู้สึกเหมือน " + Math.round(feelsLike) + "°C");
         condText.setTextColor(Color.parseColor("#E2E8F0"));
-        condText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        setScaledTextSize(condText, 14);
         leftHero.addView(condText);
 
         heroCard.addView(leftHero, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.2f));
 
-        // ตารางค่าสถิติอากาศฝั่งขวา
         LinearLayout metricsRow = new LinearLayout(this);
         metricsRow.setOrientation(LinearLayout.HORIZONTAL);
-        metricsRow.addView(createMetricCard("💧 ความชื้นสัมพัทธ์", humidity + "%"));
-        metricsRow.addView(createMetricCard("🌬️ ความเร็วลม", wind + " km/h"));
+        metricsRow.addView(createMetricCard("💧 ความชื้น", humidity + "%"));
+        metricsRow.addView(createMetricCard("🌬️ ลม", wind + " km/h"));
         metricsRow.addView(createMetricCard("🧭 ความกดอากาศ", Math.round(pressure) + " hPa"));
         heroCard.addView(metricsRow);
 
         weatherDetailContainer.addView(heroCard);
 
-        // 2. แถบพยากรณ์อากาศรายชั่วโมง (24 ชั่วโมงข้างหน้า)
         weatherDetailContainer.addView(createSectionHeader("🕒 พยากรณ์อากาศรายชั่วโมง (24 ชั่วโมงข้างหน้า)"));
         HorizontalScrollView hourlyScroll = new HorizontalScrollView(this);
         hourlyScroll.setHorizontalScrollBarEnabled(false);
@@ -668,13 +1608,12 @@ public class MainActivity extends Activity {
                 int r = hRain != null ? hRain.optInt(i, 0) : 0;
                 int c = hCodes != null ? hCodes.optInt(i, 0) : 0;
 
-                hourlyRow.addView(createCompactDayWeatherBox(timeLabel + " น.", c, t, t, r));
+                hourlyRow.addView(createDayWeatherBox(timeLabel + " น.", c, t, t, r, false));
             }
         }
         hourlyScroll.addView(hourlyRow);
         weatherDetailContainer.addView(hourlyScroll);
 
-        // 3. พยากรณ์อากาศล่วงหน้า 7 วันแบบละเอียด
         weatherDetailContainer.addView(createSectionHeader("📅 พยากรณ์อากาศล่วงหน้า 7 วัน"));
         LinearLayout sevenDaysList = new LinearLayout(this);
         sevenDaysList.setOrientation(LinearLayout.VERTICAL);
@@ -721,14 +1660,14 @@ public class MainActivity extends Activity {
         TextView valTv = new TextView(this);
         valTv.setText(value);
         valTv.setTextColor(Color.WHITE);
-        valTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        setScaledTextSize(valTv, 17);
         valTv.setTypeface(null, Typeface.BOLD);
         box.addView(valTv);
 
         TextView titleTv = new TextView(this);
         titleTv.setText(title);
         titleTv.setTextColor(Color.parseColor("#94A3B8"));
-        titleTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        setScaledTextSize(titleTv, 11);
         titleTv.setPadding(0, dp(4), 0, 0);
         box.addView(titleTv);
 
@@ -746,40 +1685,41 @@ public class MainActivity extends Activity {
         row.setPadding(dp(20), dp(12), dp(20), dp(12));
 
         GradientDrawable bg = new GradientDrawable();
-        bg.setColor(Color.parseColor("#661E293B"));
+        bg.setColor(getCardBgColor());
         bg.setCornerRadius(dp(14));
+        bg.setStroke(dp(1), getCardStrokeColor());
         row.setBackground(bg);
 
         TextView dayTv = new TextView(this);
         dayTv.setText(dayTitle);
-        dayTv.setTextColor(Color.WHITE);
-        dayTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        dayTv.setTextColor(getPrimaryTextColor());
+        setScaledTextSize(dayTv, 14);
         dayTv.setTypeface(null, Typeface.BOLD);
         row.addView(dayTv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.2f));
 
         TextView condTv = new TextView(this);
         condTv.setText(weatherCodeToEmoji(code) + "  " + weatherCodeToThaiText(code));
-        condTv.setTextColor(Color.parseColor("#E2E8F0"));
-        condTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        condTv.setTextColor(getPrimaryTextColor());
+        setScaledTextSize(condTv, 14);
         row.addView(condTv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.3f));
 
         TextView rainTv = new TextView(this);
         rainTv.setText("💧 โอกาสฝนตก " + rain + "%");
         rainTv.setTextColor(Color.parseColor("#38BDF8"));
-        rainTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        setScaledTextSize(rainTv, 13);
         rainTv.setTypeface(null, Typeface.BOLD);
         row.addView(rainTv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
         TextView extraTv = new TextView(this);
         extraTv.setText("☀️ UV " + Math.round(uv) + "   🌬️ ลม " + Math.round(windMax) + " km/h");
-        extraTv.setTextColor(Color.parseColor("#94A3B8"));
-        extraTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        extraTv.setTextColor(getSecondaryTextColor());
+        setScaledTextSize(extraTv, 12);
         row.addView(extraTv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.2f));
 
         TextView tempTv = new TextView(this);
         tempTv.setText("สูงสุด " + maxT + "° / ต่ำสุด " + minT + "°C");
-        tempTv.setTextColor(Color.WHITE);
-        tempTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        tempTv.setTextColor(getPrimaryTextColor());
+        setScaledTextSize(tempTv, 14);
         tempTv.setTypeface(null, Typeface.BOLD);
         tempTv.setGravity(Gravity.END);
         row.addView(tempTv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
@@ -791,7 +1731,7 @@ public class MainActivity extends Activity {
         return row;
     }
 
-    // ================= ดึงข่าวสารจาก YouTube (กรอบสีแดงหน้า Home) =================
+    // ================= ดึงข่าวสารจาก YouTube =================
     private void fetchYoutubeNews() {
         executor.execute(new Runnable() {
             @Override
@@ -807,6 +1747,7 @@ public class MainActivity extends Activity {
                 mainHandler.post(new Runnable() {
                     @Override
                     public void run() {
+                        if (homeYoutubeRow == null) return;
                         homeYoutubeRow.removeAllViews();
                         if (newsList.isEmpty()) {
                             homeYoutubeRow.addView(createPromptCard("กำลังโหลดข่าวสารจาก YouTube...", new View.OnClickListener() {
@@ -867,8 +1808,9 @@ public class MainActivity extends Activity {
         card.setPadding(dp(8), dp(8), dp(8), dp(10));
 
         final GradientDrawable normalBg = new GradientDrawable();
-        normalBg.setColor(Color.parseColor("#991E293B"));
+        normalBg.setColor(getCardBgColor());
         normalBg.setCornerRadius(dp(14));
+        normalBg.setStroke(dp(1), getCardStrokeColor());
 
         final GradientDrawable focusBg = new GradientDrawable();
         focusBg.setColor(Color.parseColor("#334155"));
@@ -882,16 +1824,15 @@ public class MainActivity extends Activity {
         final ImageView thumb = new ImageView(this);
         thumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
         thumb.setBackgroundColor(Color.parseColor("#0F172A"));
-        LinearLayout.LayoutParams imgLp = new LinearLayout.LayoutParams(dp(220), dp(124)); // สัดส่วน 16:9
+        LinearLayout.LayoutParams imgLp = new LinearLayout.LayoutParams(dp(220), dp(124));
         card.addView(thumb, imgLp);
 
-        final String thumbUrl = "https://i.ytimg.com/vi/" + videoId + "/mqdefault.jpg";
-        loadImageAsync(thumbUrl, thumb);
+        loadImageAsync("https://i.ytimg.com/vi/" + videoId + "/mqdefault.jpg", thumb);
 
         TextView titleTv = new TextView(this);
         titleTv.setText(title);
-        titleTv.setTextColor(Color.WHITE);
-        titleTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        titleTv.setTextColor(getPrimaryTextColor());
+        setScaledTextSize(titleTv, 12);
         titleTv.setTypeface(null, Typeface.BOLD);
         titleTv.setMaxLines(2);
         titleTv.setEllipsize(TextUtils.TruncateAt.END);
@@ -901,7 +1842,7 @@ public class MainActivity extends Activity {
         TextView chTv = new TextView(this);
         chTv.setText("▶️ " + channelName);
         chTv.setTextColor(Color.parseColor("#F87171"));
-        chTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        setScaledTextSize(chTv, 11);
         card.addView(chTv);
 
         card.setOnFocusChangeListener(new View.OnFocusChangeListener() {
@@ -930,20 +1871,22 @@ public class MainActivity extends Activity {
         return card;
     }
 
-    // ================= ดึงข้อมูล Emby (ทั้งหน้า Home และแยกหมวดหมู่ในหน้า Movies ตามรูปที่ 4) =================
+    // ================= ดึงข้อมูล Emby =================
     private void fetchEmbyData() {
         final String serverUrl = prefs.getString("emby_url", "");
         final String username = prefs.getString("emby_user", "");
         final String password = prefs.getString("emby_pass", "");
 
         if (TextUtils.isEmpty(serverUrl)) {
-            homeEmbyRow.removeAllViews();
-            homeEmbyRow.addView(createPromptCard("➕ กดเพื่อตั้งค่าเชื่อมต่อเซิร์ฟเวอร์ Emby ของคุณ", new View.OnClickListener() {
-                @Override
-                public void onClick(View v) {
-                    showEmbyConfigDialog();
-                }
-            }));
+            if (homeEmbyRow != null) {
+                homeEmbyRow.removeAllViews();
+                homeEmbyRow.addView(createPromptCard("➕ กดเพื่อตั้งค่าเชื่อมต่อเซิร์ฟเวอร์ Emby ของคุณ", new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        showEmbyConfigDialog();
+                    }
+                }));
+            }
             renderDemoMoviesCategories();
             return;
         }
@@ -960,7 +1903,7 @@ public class MainActivity extends Activity {
                     conn.setReadTimeout(6000);
                     conn.setRequestProperty("Content-Type", "application/json");
                     conn.setRequestProperty("X-Emby-Authorization",
-                            "MediaBrowser Client=\"FreeMyTV\", Device=\"MiBoxS2\", DeviceId=\"miboxs2-custom\", Version=\"2.0.0\"");
+                            "MediaBrowser Client=\"FreeMyTV\", Device=\"MiBoxS2\", DeviceId=\"miboxs2-custom\", Version=\"3.0.0\"");
                     conn.setDoOutput(true);
 
                     JSONObject payload = new JSONObject();
@@ -975,11 +1918,9 @@ public class MainActivity extends Activity {
                     final String token = authJson.getString("AccessToken");
                     final String userId = authJson.getJSONObject("User").getString("Id");
 
-                    // 1. ดึงรายการหนังมาใหม่สำหรับหน้า Home
                     String latestUrl = cleanUrl + "/Users/" + userId + "/Items/Latest?IncludeItemTypes=Movie,Series&Limit=12&Fields=ProductionYear&api_key=" + token;
                     final JSONArray latestItems = new JSONArray(httpGet(latestUrl));
 
-                    // 2. ดึงหมวดหมู่คลังหนังทั้งหมด (Views) สำหรับหน้า Movies (เช่น หนังไทย, หนังฝรั่ง, ซีรีส์, อนิเมะ)
                     String viewsUrl = cleanUrl + "/Users/" + userId + "/Views?api_key=" + token;
                     JSONObject viewsObj = new JSONObject(httpGet(viewsUrl));
                     JSONArray viewsArr = viewsObj.optJSONArray("Items");
@@ -1008,48 +1949,51 @@ public class MainActivity extends Activity {
                     mainHandler.post(new Runnable() {
                         @Override
                         public void run() {
-                            // อัปเดตแถว Emby ในหน้า Home
-                            homeEmbyRow.removeAllViews();
-                            for (int i = 0; i < latestItems.length(); i++) {
-                                JSONObject item = latestItems.optJSONObject(i);
-                                if (item != null) {
-                                    homeEmbyRow.addView(createEmbyPosterCard(item, cleanUrl, token));
+                            if (homeEmbyRow != null) {
+                                homeEmbyRow.removeAllViews();
+                                for (int i = 0; i < latestItems.length(); i++) {
+                                    JSONObject item = latestItems.optJSONObject(i);
+                                    if (item != null) {
+                                        homeEmbyRow.addView(createEmbyPosterCard(item, cleanUrl, token));
+                                    }
                                 }
                             }
 
-                            // อัปเดตหมวดหมู่แยกแถวในหน้า Movies (ตามรูปที่ 4)
-                            moviesCategoriesContainer.removeAllViews();
-                            for (int c = 0; c < catNames.size(); c++) {
-                                moviesCategoriesContainer.addView(createSectionHeader("📂 " + catNames.get(c)));
-                                HorizontalScrollView sc = new HorizontalScrollView(MainActivity.this);
-                                sc.setHorizontalScrollBarEnabled(false);
-                                LinearLayout row = new LinearLayout(MainActivity.this);
-                                row.setOrientation(LinearLayout.HORIZONTAL);
+                            if (moviesCategoriesContainer != null) {
+                                moviesCategoriesContainer.removeAllViews();
+                                for (int c = 0; c < catNames.size(); c++) {
+                                    moviesCategoriesContainer.addView(createSectionHeader("📂 " + catNames.get(c)));
+                                    HorizontalScrollView sc = new HorizontalScrollView(MainActivity.this);
+                                    sc.setHorizontalScrollBarEnabled(false);
+                                    LinearLayout row = new LinearLayout(MainActivity.this);
+                                    row.setOrientation(LinearLayout.HORIZONTAL);
 
-                                JSONArray arr = catItemsList.get(c);
-                                for (int j = 0; j < arr.length(); j++) {
-                                    JSONObject m = arr.optJSONObject(j);
-                                    if (m != null) {
-                                        row.addView(createEmbyPosterCard(m, cleanUrl, token));
+                                    JSONArray arr = catItemsList.get(c);
+                                    for (int j = 0; j < arr.length(); j++) {
+                                        JSONObject m = arr.optJSONObject(j);
+                                        if (m != null) {
+                                            row.addView(createEmbyPosterCard(m, cleanUrl, token));
+                                        }
                                     }
+                                    sc.addView(row);
+                                    moviesCategoriesContainer.addView(sc);
                                 }
-                                sc.addView(row);
-                                moviesCategoriesContainer.addView(sc);
                             }
                         }
                     });
-
                 } catch (Exception e) {
                     mainHandler.post(new Runnable() {
                         @Override
                         public void run() {
-                            homeEmbyRow.removeAllViews();
-                            homeEmbyRow.addView(createPromptCard("⚠️ เชื่อมต่อ Emby ไม่สำเร็จ กดเพื่อตั้งค่า IP / รหัสผ่าน", new View.OnClickListener() {
-                                @Override
-                                public void onClick(View v) {
-                                    showEmbyConfigDialog();
-                                }
-                            }));
+                            if (homeEmbyRow != null) {
+                                homeEmbyRow.removeAllViews();
+                                homeEmbyRow.addView(createPromptCard("⚠️ เชื่อมต่อ Emby ไม่สำเร็จ กดเพื่อตั้งค่า IP / รหัสผ่าน", new View.OnClickListener() {
+                                    @Override
+                                    public void onClick(View v) {
+                                        showEmbyConfigDialog();
+                                    }
+                                }));
+                            }
                             renderDemoMoviesCategories();
                         }
                     });
@@ -1058,8 +2002,8 @@ public class MainActivity extends Activity {
         });
     }
 
-    // แสดงหมวดหมู่ตัวอย่างในหน้า Movies ตามรูปที่ 4 กรณีที่ยังไม่ได้กรอก IP ของ Emby
     private void renderDemoMoviesCategories() {
+        if (moviesCategoriesContainer == null) return;
         moviesCategoriesContainer.removeAllViews();
         String[] sampleCategories = new String[]{"หนังไทย", "หนังฝรั่ง", "ซีรีย์", "อนิเมะ"};
         for (int i = 0; i < sampleCategories.length; i++) {
@@ -1090,8 +2034,9 @@ public class MainActivity extends Activity {
         card.setPadding(dp(8), dp(8), dp(8), dp(10));
 
         final GradientDrawable normalBg = new GradientDrawable();
-        normalBg.setColor(Color.parseColor("#991E293B"));
+        normalBg.setColor(getCardBgColor());
         normalBg.setCornerRadius(dp(14));
+        normalBg.setStroke(dp(1), getCardStrokeColor());
 
         final GradientDrawable focusBg = new GradientDrawable();
         focusBg.setColor(Color.parseColor("#334155"));
@@ -1112,8 +2057,8 @@ public class MainActivity extends Activity {
 
         TextView titleTv = new TextView(this);
         titleTv.setText(name);
-        titleTv.setTextColor(Color.WHITE);
-        titleTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        titleTv.setTextColor(getPrimaryTextColor());
+        setScaledTextSize(titleTv, 12);
         titleTv.setTypeface(null, Typeface.BOLD);
         titleTv.setSingleLine(true);
         titleTv.setEllipsize(TextUtils.TruncateAt.END);
@@ -1122,8 +2067,8 @@ public class MainActivity extends Activity {
 
         TextView yearTv = new TextView(this);
         yearTv.setText(year);
-        yearTv.setTextColor(Color.parseColor("#94A3B8"));
-        yearTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        yearTv.setTextColor(getSecondaryTextColor());
+        setScaledTextSize(yearTv, 10);
         card.addView(yearTv);
 
         card.setOnFocusChangeListener(new View.OnFocusChangeListener() {
@@ -1147,30 +2092,90 @@ public class MainActivity extends Activity {
         return card;
     }
 
-    // ================= ฟังก์ชันเสริมและหน้าต่างตั้งค่า =================
+    // ================= ปุ่มสลับหน้าและส่วนประกอบ UI =================
+    private TextView createNavTabButton(String text, final int tabIndex) {
+        final TextView tv = new TextView(this);
+        tv.setText(text);
+        setScaledTextSize(tv, 14);
+        tv.setTypeface(null, Typeface.BOLD);
+        tv.setPadding(dp(20), dp(7), dp(20), dp(7));
+        tv.setFocusable(true);
+        tv.setClickable(true);
+
+        tv.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                switchTab(tabIndex);
+            }
+        });
+
+        tv.setOnFocusChangeListener(new View.OnFocusChangeListener() {
+            @Override
+            public void onFocusChange(View v, boolean hasFocus) {
+                updateNavTabStyles();
+            }
+        });
+
+        return tv;
+    }
+
+    private void switchTab(int index) {
+        currentTab = index;
+        pageHome.setVisibility(index == 0 ? View.VISIBLE : View.GONE);
+        pageMovies.setVisibility(index == 1 ? View.VISIBLE : View.GONE);
+        pageWeather.setVisibility(index == 2 ? View.VISIBLE : View.GONE);
+        updateNavTabStyles();
+    }
+
+    private void updateNavTabStyles() {
+        TextView[] tabs = new TextView[]{tabHomeBtn, tabMoviesBtn, tabWeatherBtn};
+        for (int i = 0; i < tabs.length; i++) {
+            TextView t = tabs[i];
+            if (t == null) continue;
+            boolean isSelected = (currentTab == i);
+            boolean isFocused = t.hasFocus();
+
+            GradientDrawable bg = new GradientDrawable();
+            bg.setCornerRadius(dp(20));
+
+            if (isFocused) {
+                bg.setColor(Color.parseColor("#38BDF8"));
+                t.setTextColor(Color.parseColor("#0F172A"));
+            } else if (isSelected) {
+                bg.setColor(isLightTheme() ? Color.parseColor("#0F172A") : Color.parseColor("#33FFFFFF"));
+                bg.setStroke(dp(1), Color.parseColor("#88FFFFFF"));
+                t.setTextColor(Color.WHITE);
+            } else {
+                bg.setColor(Color.TRANSPARENT);
+                t.setTextColor(getSecondaryTextColor());
+            }
+            t.setBackground(bg);
+        }
+    }
+
     private TextView createSectionHeader(String title) {
         TextView tv = new TextView(this);
         tv.setText(title);
-        tv.setTextColor(Color.parseColor("#E2E8F0"));
-        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        tv.setTextColor(getPrimaryTextColor());
+        setScaledTextSize(tv, 15);
         tv.setTypeface(null, Typeface.BOLD);
-        tv.setPadding(dp(4), dp(20), 0, dp(8));
+        tv.setPadding(dp(4), dp(18), 0, dp(8));
         return tv;
     }
 
     private View createPromptCard(String message, View.OnClickListener listener) {
         TextView btn = new TextView(this);
         btn.setText(message);
-        btn.setTextColor(Color.WHITE);
-        btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        btn.setPadding(dp(24), dp(26), dp(24), dp(26));
+        btn.setTextColor(getPrimaryTextColor());
+        setScaledTextSize(btn, 13);
+        btn.setPadding(dp(22), dp(22), dp(22), dp(22));
         btn.setFocusable(true);
         btn.setClickable(true);
 
         final GradientDrawable normal = new GradientDrawable();
-        normal.setColor(Color.parseColor("#661E293B"));
+        normal.setColor(getCardBgColor());
         normal.setCornerRadius(dp(16));
-        normal.setStroke(dp(1), Color.parseColor("#475569"));
+        normal.setStroke(dp(1), getCardStrokeColor());
 
         final GradientDrawable focused = new GradientDrawable();
         focused.setColor(Color.parseColor("#16A34A"));
@@ -1188,21 +2193,23 @@ public class MainActivity extends Activity {
         return btn;
     }
 
-    private View createToolButton(String text, View.OnClickListener listener) {
-        TextView tv = new TextView(this);
+    private TextView createToolButton(String text, View.OnClickListener listener) {
+        final TextView tv = new TextView(this);
         tv.setText(text);
-        tv.setTextColor(Color.parseColor("#E2E8F0"));
-        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        tv.setPadding(dp(12), dp(6), dp(12), dp(6));
+        tv.setTextColor(getPrimaryTextColor());
+        setScaledTextSize(tv, 11);
+        tv.setTypeface(null, Typeface.BOLD);
+        tv.setPadding(dp(10), dp(6), dp(10), dp(6));
         tv.setFocusable(true);
         tv.setClickable(true);
 
         final GradientDrawable normal = new GradientDrawable();
-        normal.setColor(Color.parseColor("#661E293B"));
+        normal.setColor(getCardBgColor());
         normal.setCornerRadius(dp(14));
+        normal.setStroke(dp(1), getCardStrokeColor());
 
         final GradientDrawable focus = new GradientDrawable();
-        focus.setColor(Color.parseColor("#3B82F6"));
+        focus.setColor(Color.parseColor("#2563EB"));
         focus.setCornerRadius(dp(14));
         focus.setStroke(dp(1), Color.WHITE);
 
@@ -1211,6 +2218,7 @@ public class MainActivity extends Activity {
             @Override
             public void onFocusChange(View v, boolean hasFocus) {
                 v.setBackground(hasFocus ? focus : normal);
+                tv.setTextColor(hasFocus ? Color.WHITE : getPrimaryTextColor());
             }
         });
         tv.setOnClickListener(listener);
@@ -1261,25 +2269,18 @@ public class MainActivity extends Activity {
     }
 
     private void showAllAppsDialog() {
-        PackageManager pm = getPackageManager();
-        List<ApplicationInfo> apps = pm.getInstalledApplications(0);
-        final ArrayList<String> names = new ArrayList<String>();
-        final ArrayList<Intent> intents = new ArrayList<Intent>();
-
-        for (ApplicationInfo app : apps) {
-            Intent intent = pm.getLeanbackLaunchIntentForPackage(app.packageName);
-            if (intent == null) intent = pm.getLaunchIntentForPackage(app.packageName);
-            if (intent != null && !app.packageName.equals(getPackageName())) {
-                names.add(pm.getApplicationLabel(app).toString());
-                intents.add(intent);
-            }
+        final List<AppEntry> apps = getOrderedInstalledApps();
+        String[] names = new String[apps.size()];
+        for (int i = 0; i < apps.size(); i++) {
+            names[i] = apps.get(i).label;
         }
         new AlertDialog.Builder(this)
-                .setTitle("แอปทั้งหมดในเครื่อง")
-                .setItems(names.toArray(new String[0]), new DialogInterface.OnClickListener() {
+                .setTitle("แอปทั้งหมดในเครื่อง (กดค้างที่แถบหน้าหลักเพื่อตั้งค่าแอปได้)")
+                .setItems(names, new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface d, int which) {
-                        startActivity(intents.get(which));
+                        AppEntry e = apps.get(which);
+                        launchApp(new String[]{e.pkg}, "", e.label);
                     }
                 })
                 .show();
@@ -1308,6 +2309,25 @@ public class MainActivity extends Activity {
         });
     }
 
+    private String resolveInstalledPackage(String[] candidates, String keyword) {
+        PackageManager pm = getPackageManager();
+        for (String pkg : candidates) {
+            try {
+                pm.getPackageInfo(pkg, 0);
+                return pkg;
+            } catch (Exception ignored) {}
+        }
+        if (!TextUtils.isEmpty(keyword)) {
+            for (ApplicationInfo app : pm.getInstalledApplications(0)) {
+                String label = pm.getApplicationLabel(app).toString().toLowerCase(Locale.ROOT);
+                if (label.contains(keyword)) {
+                    return app.packageName;
+                }
+            }
+        }
+        return "";
+    }
+
     private Drawable findAppIcon(String[] candidates, String keyword) {
         PackageManager pm = getPackageManager();
         for (String pkg : candidates) {
@@ -1315,10 +2335,12 @@ public class MainActivity extends Activity {
                 return pm.getApplicationIcon(pkg);
             } catch (Exception ignored) {}
         }
-        for (ApplicationInfo app : pm.getInstalledApplications(0)) {
-            String label = pm.getApplicationLabel(app).toString().toLowerCase(Locale.ROOT);
-            if (label.contains(keyword)) {
-                return pm.getApplicationIcon(app);
+        if (!TextUtils.isEmpty(keyword)) {
+            for (ApplicationInfo app : pm.getInstalledApplications(0)) {
+                String label = pm.getApplicationLabel(app).toString().toLowerCase(Locale.ROOT);
+                if (label.contains(keyword)) {
+                    return pm.getApplicationIcon(app);
+                }
             }
         }
         return null;
@@ -1334,28 +2356,29 @@ public class MainActivity extends Activity {
                 return;
             }
         }
-        for (ApplicationInfo app : pm.getInstalledApplications(0)) {
-            String label = pm.getApplicationLabel(app).toString().toLowerCase(Locale.ROOT);
-            if (label.contains(keyword)) {
-                Intent intent = pm.getLeanbackLaunchIntentForPackage(app.packageName);
-                if (intent == null) intent = pm.getLaunchIntentForPackage(app.packageName);
-                if (intent != null) {
-                    startActivity(intent);
-                    return;
+        if (!TextUtils.isEmpty(keyword)) {
+            for (ApplicationInfo app : pm.getInstalledApplications(0)) {
+                String label = pm.getApplicationLabel(app).toString().toLowerCase(Locale.ROOT);
+                if (label.contains(keyword)) {
+                    Intent intent = pm.getLeanbackLaunchIntentForPackage(app.packageName);
+                    if (intent == null) intent = pm.getLaunchIntentForPackage(app.packageName);
+                    if (intent != null) {
+                        startActivity(intent);
+                        return;
+                    }
                 }
             }
         }
         Toast.makeText(this, "ยังไม่ได้ติดตั้งแอป " + title + " ในเครื่องนี้", Toast.LENGTH_LONG).show();
     }
 
-    // แสดงทั้งเวลาและวันที่ภาษาไทย
-    private void startClockAndDate() {
+    private void startClockAndNetworkMonitor() {
         Runnable ticker = new Runnable() {
             @Override
             public void run() {
                 Date now = new Date();
                 SimpleDateFormat sdfTime = new SimpleDateFormat("HH:mm", Locale.getDefault());
-                clockView.setText(sdfTime.format(now));
+                if (clockView != null) clockView.setText(sdfTime.format(now));
 
                 Calendar cal = Calendar.getInstance();
                 cal.setTime(now);
@@ -1366,7 +2389,10 @@ public class MainActivity extends Activity {
                 String monthName = thaiMonths[cal.get(Calendar.MONTH)];
                 int buddhistYear = cal.get(Calendar.YEAR) + 543;
 
-                dateView.setText(dayName + "ที่ " + dayNum + " " + monthName + " " + buddhistYear);
+                if (dateView != null) {
+                    dateView.setText(dayName + "ที่ " + dayNum + " " + monthName + " " + buddhistYear);
+                }
+                updateWifiIndicator();
                 mainHandler.postDelayed(this, 10000);
             }
         };
@@ -1425,6 +2451,7 @@ public class MainActivity extends Activity {
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setConnectTimeout(6000);
         conn.setReadTimeout(6000);
+        conn.setRequestProperty("User-Agent", "FreeMyTV-AndroidTV/3.0");
         return readStream(conn.getInputStream());
     }
 
